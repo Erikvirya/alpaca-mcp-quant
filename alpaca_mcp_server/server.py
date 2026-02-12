@@ -39,6 +39,45 @@ try:
 except Exception:
     vbt = None
 
+_BARS_DF_CACHE: Dict[str, Any] = {}
+_BARS_DF_CACHE_TTL_SECONDS = 300
+
+
+def _bars_cache_get(symbol: str, timeframe: str, limit: int) -> Any:
+    if pd is None:
+        return None, False
+    key = f"{symbol}|{timeframe}|{int(limit)}"
+    entry = _BARS_DF_CACHE.get(key)
+    if not entry:
+        return None, False
+    expires_at = entry.get("expires_at")
+    if not isinstance(expires_at, (int, float)):
+        return None, False
+    if expires_at <= time.time():
+        return None, False
+    df = entry.get("df")
+    if df is None:
+        return None, False
+    try:
+        return df.copy(), True
+    except Exception:
+        return None, False
+
+
+def _bars_cache_set(symbol: str, timeframe: str, limit: int, df: Any) -> None:
+    if pd is None:
+        return
+    if df is None:
+        return
+    try:
+        key = f"{symbol}|{timeframe}|{int(limit)}"
+        _BARS_DF_CACHE[key] = {
+            "expires_at": time.time() + float(_BARS_DF_CACHE_TTL_SECONDS),
+            "df": df,
+        }
+    except Exception:
+        return
+
 from dotenv import load_dotenv
 
 from alpaca.common.enums import SupportedCurrencies
@@ -1029,6 +1068,10 @@ async def execute_vectorbt_strategy(symbol: str, strategy_code: str) -> str:
         return points
 
     try:
+        t0 = time.perf_counter()
+        timings_ms: Dict[str, Any] = {}
+        cache_hit = False
+
         if not strategy_code or not strategy_code.strip():
             return json.dumps({"error": {"message": "strategy_code is empty"}}, separators=(",", ":"))
 
@@ -1061,46 +1104,60 @@ async def execute_vectorbt_strategy(symbol: str, strategy_code: str) -> str:
                 separators=(",", ":"),
             )
 
-        # Fetch ~1000 daily bars (approx 4 years of trading days)
-        now_utc = datetime.now(timezone.utc)
-        start_time = now_utc - timedelta(days=2000)
-        request_params = StockBarsRequest(
-            symbol_or_symbols=[symbol],
-            timeframe=TimeFrame.Day,
-            start=start_time,
-            end=None,
-            limit=1000,
-            sort=Sort.ASC,
-        )
+        timeframe_str = "1Day"
+        bar_limit = 1000
 
-        bars = stock_historical_data_client.get_stock_bars(request_params)
-        bar_list = bars[symbol] if bars and symbol in bars and bars[symbol] else []
-        if not bar_list:
-            return json.dumps(
-                {"error": {"message": f"No bar data found for {symbol}"}},
-                separators=(",", ":"),
+        t_cache_start = time.perf_counter()
+        df, cache_hit = _bars_cache_get(symbol, timeframe_str, bar_limit)
+        timings_ms["cache_lookup"] = int((time.perf_counter() - t_cache_start) * 1000)
+
+        if not cache_hit:
+            now_utc = datetime.now(timezone.utc)
+            t_bars_start = time.perf_counter()
+
+            request_params = StockBarsRequest(
+                symbol_or_symbols=[symbol],
+                timeframe=TimeFrame.Day,
+                start=None,
+                end=now_utc,
+                limit=bar_limit,
+                sort=Sort.DESC,
             )
 
-        rows = []
-        for bar in bar_list:
-            rows.append(
-                {
-                    "timestamp": bar.timestamp,
-                    "open": bar.open,
-                    "high": bar.high,
-                    "low": bar.low,
-                    "close": bar.close,
-                    "volume": bar.volume,
-                }
-            )
-        df = pd.DataFrame(rows)
-        if "timestamp" not in df.columns:
-            return json.dumps(
-                {"error": {"message": "Unexpected bars format: missing timestamp"}},
-                separators=(",", ":"),
-            )
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-        df = df.set_index("timestamp").sort_index()
+            bars = stock_historical_data_client.get_stock_bars(request_params)
+            timings_ms["alpaca_bars_fetch"] = int((time.perf_counter() - t_bars_start) * 1000)
+
+            bar_list = bars[symbol] if bars and symbol in bars and bars[symbol] else []
+            if not bar_list:
+                return json.dumps(
+                    {"error": {"message": f"No bar data found for {symbol}"}},
+                    separators=(",", ":"),
+                )
+
+            t_df_start = time.perf_counter()
+            rows = []
+            for bar in bar_list:
+                rows.append(
+                    {
+                        "timestamp": bar.timestamp,
+                        "open": bar.open,
+                        "high": bar.high,
+                        "low": bar.low,
+                        "close": bar.close,
+                        "volume": bar.volume,
+                    }
+                )
+            df = pd.DataFrame(rows)
+            if "timestamp" not in df.columns:
+                return json.dumps(
+                    {"error": {"message": "Unexpected bars format: missing timestamp"}},
+                    separators=(",", ":"),
+                )
+            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+            df = df.set_index("timestamp").sort_index()
+            timings_ms["df_build"] = int((time.perf_counter() - t_df_start) * 1000)
+
+            _bars_cache_set(symbol, timeframe_str, bar_limit, df)
 
         def _lag_one(x: Any) -> Any:
             if x is None:
@@ -1168,7 +1225,10 @@ async def execute_vectorbt_strategy(symbol: str, strategy_code: str) -> str:
             "np": np,
         }
 
+        t_exec_start = time.perf_counter()
         exec(strategy_code, sandbox, sandbox)
+        timings_ms["strategy_exec"] = int((time.perf_counter() - t_exec_start) * 1000)
+
         pf = sandbox.get("pf")
         if pf is None:
             return json.dumps(
@@ -1180,10 +1240,13 @@ async def execute_vectorbt_strategy(symbol: str, strategy_code: str) -> str:
                 separators=(",", ":"),
             )
 
+        t_stats_start = time.perf_counter()
         stats = pf.stats()
         stats_dict = stats.to_dict() if hasattr(stats, "to_dict") else dict(stats)
         stats_dict = {str(k): _json_safe_value(v) for k, v in stats_dict.items()}
+        timings_ms["stats"] = int((time.perf_counter() - t_stats_start) * 1000)
 
+        t_ts_start = time.perf_counter()
         equity = pf.value()
         if pd is not None and isinstance(equity, pd.DataFrame):
             if equity.shape[1] == 1:
@@ -1198,11 +1261,16 @@ async def execute_vectorbt_strategy(symbol: str, strategy_code: str) -> str:
         close = df["close"]
         benchmark_cum_returns = close.pct_change().fillna(0).add(1).cumprod().sub(1)
         benchmark_points = _series_to_points(benchmark_cum_returns, "r")
+        timings_ms["timeseries"] = int((time.perf_counter() - t_ts_start) * 1000)
+
+        timings_ms["total"] = int((time.perf_counter() - t0) * 1000)
 
         payload = {
             "symbol": symbol,
-            "timeframe": "1Day",
+            "timeframe": timeframe_str,
             "bar_count": int(len(df)),
+            "cache_hit": bool(cache_hit),
+            "timings_ms": {str(k): _json_safe_value(v) for k, v in timings_ms.items()},
             "stats": stats_dict,
             "equity_curve": equity_points,
             "cum_returns": cum_return_points,
