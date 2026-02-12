@@ -1,4 +1,4 @@
-# Alpaca MCP Quant: The "Safety Valve" for AI Trading
+# Alpaca MCP Quant: Backtester for Alpaca MCP
 
 The problem: LLMs can hallucinate trading strategies that sound good but lose money.
 
