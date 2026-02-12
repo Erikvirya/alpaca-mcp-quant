@@ -33,7 +33,7 @@ Set environment variables:
 ### 3) Run the MCP server (stdio)
 
 ```bash
-python -m alpaca_mcp_server.server --transport stdio
+python -m alpaca_mcp_server.cli serve --transport stdio
 ```
 
 ### 4) Use the tool
@@ -57,4 +57,51 @@ The tool returns JSON containing:
 - `equity_curve`
 - `cum_returns`
 - `benchmark_cum_returns`
+
+## Connect Claude Desktop (Windows)
+
+### 1) Install deps into the same Python you will run from Claude
+
+If you use a virtual environment, install requirements there:
+
+```bash
+pip install -r requirements.txt
+```
+
+### 2) Create/update your Claude Desktop MCP config
+
+Edit (or create) this file:
+
+`C:\Users\<YOU>\AppData\Roaming\Claude\claude_desktop_config.json`
+
+Example config (replace paths + keys):
+
+```json
+{
+  "mcpServers": {
+    "alpaca-mcp-quant": {
+      "command": "C:/Users/<YOU>/venvs/alpaca-mcp312/Scripts/python.exe",
+      "args": ["-m", "alpaca_mcp_server.cli", "serve", "--transport", "stdio"],
+      "env": {
+        "PYTHONPATH": "C:/Users/<YOU>/Documents/ALPACA_BACKTESTING/alpaca-mcp-quant",
+        "ALPACA_API_KEY": "YOUR_KEY",
+        "ALPACA_SECRET_KEY": "YOUR_SECRET",
+        "ALPACA_PAPER_TRADE": "True"
+      }
+    }
+  }
+}
+```
+
+Notes:
+
+- `PYTHONPATH` must point at the repo root so `alpaca_mcp_server` can be imported.
+- Use forward slashes (`/`) in JSON paths to avoid escaping issues.
+- After editing the config, restart Claude Desktop.
+
+### 3) Verify in Claude
+
+After restart, you should see the server connect and the tool become available. Try asking Claude to run:
+
+- `execute_vectorbt_strategy` with a simple moving average crossover strategy.
 
