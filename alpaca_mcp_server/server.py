@@ -23,6 +23,9 @@ import argparse
 import traceback
 import itertools
 import math
+import csv
+import io
+import requests as _requests
 from datetime import datetime, timedelta, date, timezone
 from typing import Dict, Any, List, Optional, Union
 from pathlib import Path
@@ -1214,17 +1217,30 @@ async def execute_vectorbt_strategy(
                 else:
                     start_dt = req_end - timedelta(days=int(limit * 2))
 
-            request_params = StockBarsRequest(
-                symbol_or_symbols=symbols,
-                timeframe=timeframe_obj,
-                start=start_dt,
-                end=req_end,
-                limit=limit,
-                sort=Sort.DESC,
-                feed=DataFeed.IEX,
-            )
+            # Detect crypto symbols (contain '/')
+            is_crypto = any("/" in s for s in symbols)
 
-            bars = stock_historical_data_client.get_stock_bars(request_params)
+            if is_crypto:
+                request_params = CryptoBarsRequest(
+                    symbol_or_symbols=symbols,
+                    timeframe=timeframe_obj,
+                    start=start_dt,
+                    end=req_end,
+                    limit=limit,
+                    sort=Sort.DESC,
+                )
+                bars = crypto_historical_data_client.get_crypto_bars(request_params)
+            else:
+                request_params = StockBarsRequest(
+                    symbol_or_symbols=symbols,
+                    timeframe=timeframe_obj,
+                    start=start_dt,
+                    end=req_end,
+                    limit=limit,
+                    sort=Sort.DESC,
+                    feed=DataFeed.IEX,
+                )
+                bars = stock_historical_data_client.get_stock_bars(request_params)
             timings_ms["alpaca_bars_fetch"] = int((time.perf_counter() - t_bars_start) * 1000)
 
             t_df_start = time.perf_counter()
@@ -2870,6 +2886,235 @@ async def get_option_chain(
 
     except Exception as e:
         return f"Error retrieving option chain for {underlying_symbol}: {str(e)}"
+
+
+# ============================================================================
+# ThetaData Options Data Tools (requires local Theta Terminal running)
+# ============================================================================
+
+THETADATA_URL = os.environ.get("THETADATA_URL", "http://127.0.0.1:25503")
+
+
+def _theta_get(path: str, params: dict) -> list:
+    """Make a GET request to the local Theta Terminal REST API v3.
+    Returns a list of dicts parsed from the CSV response."""
+    url = f"{THETADATA_URL}{path}"
+    # Remove None/empty values from params
+    params = {k: v for k, v in params.items() if v is not None and v != ""}
+    resp = _requests.get(url, params=params, timeout=60)
+    resp.raise_for_status()
+    text = resp.text.strip()
+    if not text:
+        return []
+    reader = csv.DictReader(io.StringIO(text))
+    rows = []
+    for row in reader:
+        clean = {}
+        for k, v in row.items():
+            # Strip quotes and try numeric conversion
+            v = v.strip('"') if v else v
+            try:
+                if '.' in v:
+                    clean[k] = float(v)
+                else:
+                    clean[k] = int(v)
+            except (ValueError, TypeError):
+                clean[k] = v
+        rows.append(clean)
+    return rows
+
+
+@mcp.tool()
+async def get_theta_option_expirations(symbol: str) -> str:
+    """
+    List all available option expiration dates for a symbol using ThetaData.
+    Requires the Theta Terminal to be running locally.
+
+    Args:
+        symbol (str): The underlying stock symbol (e.g., 'AAPL', 'SPY', 'TSLA')
+
+    Returns:
+        str: JSON list of available expiration dates
+    """
+    try:
+        rows = _theta_get("/v3/option/list/expirations", {"symbol": symbol.upper()})
+        expirations = sorted(set(
+            row.get("expiration") for row in rows if row.get("expiration")
+        ))
+        return json.dumps({
+            "symbol": symbol.upper(),
+            "count": len(expirations),
+            "expirations": expirations,
+        }, separators=(",", ":"))
+    except _requests.exceptions.ConnectionError:
+        return json.dumps({
+            "error": "Cannot connect to Theta Terminal at " + THETADATA_URL +
+                     ". Make sure the Theta Terminal v3 is running (java -jar ThetaTerminalv3.jar)."
+        }, separators=(",", ":"))
+    except Exception as e:
+        return json.dumps({"error": str(e)}, separators=(",", ":"))
+
+
+@mcp.tool()
+async def get_theta_option_strikes(symbol: str, expiration: str) -> str:
+    """
+    List all available strike prices for a symbol and expiration using ThetaData.
+    Requires the Theta Terminal to be running locally.
+
+    Args:
+        symbol (str): The underlying stock symbol (e.g., 'AAPL')
+        expiration (str): Expiration date in YYYY-MM-DD or YYYYMMDD format
+
+    Returns:
+        str: JSON list of available strike prices
+    """
+    try:
+        rows = _theta_get("/v3/option/list/strikes", {
+            "symbol": symbol.upper(),
+            "expiration": expiration,
+        })
+        strikes = sorted(set(
+            row.get("strike") for row in rows if row.get("strike") is not None
+        ))
+        return json.dumps({
+            "symbol": symbol.upper(),
+            "expiration": expiration,
+            "count": len(strikes),
+            "strikes": strikes,
+        }, separators=(",", ":"))
+    except _requests.exceptions.ConnectionError:
+        return json.dumps({
+            "error": "Cannot connect to Theta Terminal at " + THETADATA_URL +
+                     ". Make sure the Theta Terminal v3 is running."
+        }, separators=(",", ":"))
+    except Exception as e:
+        return json.dumps({"error": str(e)}, separators=(",", ":"))
+
+
+@mcp.tool()
+async def get_theta_option_eod(
+    symbol: str,
+    expiration: str = "*",
+    strike: str = "*",
+    right: str = "call",
+    start_date: str = "",
+    end_date: str = "",
+    max_dte: Optional[int] = None,
+    num_strikes: Optional[int] = None,
+) -> str:
+    """
+    Retrieve historical End-of-Day (EOD) options data from ThetaData (FREE tier).
+    Includes OHLCV and last NBBO quote for each contract per day.
+    Requires the Theta Terminal to be running locally.
+
+    Args:
+        symbol (str): Underlying symbol (e.g., 'AAPL', 'SPY')
+        expiration (str): Expiration in YYYY-MM-DD or YYYYMMDD format, or '*' for all expirations (default: '*')
+        strike (str): Strike price in dollars (e.g., '170.000'), or '*' for all strikes (default: '*')
+        right (str): 'call' or 'put' (default: 'call')
+        start_date (str): Start date YYYY-MM-DD or YYYYMMDD (inclusive)
+        end_date (str): End date YYYY-MM-DD or YYYYMMDD (inclusive)
+        max_dte (Optional[int]): Only return contracts with DTE <= this value
+        num_strikes (Optional[int]): Number of strikes above/below ATM to return
+
+    Returns:
+        str: JSON with EOD option data (OHLCV, bid/ask, volume, trade count)
+    """
+    try:
+        params = {
+            "symbol": symbol.upper(),
+            "expiration": expiration,
+            "strike": strike,
+            "right": right.lower(),
+            "start_date": start_date,
+            "end_date": end_date,
+            "max_dte": str(max_dte) if max_dte is not None else None,
+            "num_strikes": str(num_strikes) if num_strikes is not None else None,
+        }
+        rows = _theta_get("/v3/option/history/eod", params)
+        return json.dumps({
+            "symbol": symbol.upper(),
+            "right": right.lower(),
+            "expiration_filter": expiration,
+            "strike_filter": strike,
+            "start_date": start_date,
+            "end_date": end_date,
+            "record_count": len(rows),
+            "data": rows[:500],
+            "truncated": len(rows) > 500,
+        }, separators=(",", ":"))
+    except _requests.exceptions.ConnectionError:
+        return json.dumps({
+            "error": "Cannot connect to Theta Terminal at " + THETADATA_URL +
+                     ". Make sure the Theta Terminal v3 is running."
+        }, separators=(",", ":"))
+    except _requests.exceptions.HTTPError as e:
+        return json.dumps({"error": f"ThetaData API error: {str(e)}"}, separators=(",", ":"))
+    except Exception as e:
+        return json.dumps({"error": str(e)}, separators=(",", ":"))
+
+
+@mcp.tool()
+async def get_theta_option_greeks_eod(
+    symbol: str,
+    expiration: str = "*",
+    strike: str = "*",
+    right: str = "call",
+    start_date: str = "",
+    end_date: str = "",
+    max_dte: Optional[int] = None,
+    num_strikes: Optional[int] = None,
+) -> str:
+    """
+    Retrieve historical End-of-Day (EOD) options data WITH Greeks from ThetaData (FREE tier).
+    Includes OHLCV, NBBO quote, and full greeks (delta, gamma, theta, vega, IV, etc.) per contract per day.
+    Requires the Theta Terminal to be running locally.
+
+    Args:
+        symbol (str): Underlying symbol (e.g., 'AAPL', 'SPY')
+        expiration (str): Expiration in YYYY-MM-DD or YYYYMMDD format, or '*' for all expirations (default: '*')
+        strike (str): Strike price in dollars (e.g., '170.000'), or '*' for all strikes (default: '*')
+        right (str): 'call' or 'put' (default: 'call')
+        start_date (str): Start date YYYY-MM-DD or YYYYMMDD (inclusive)
+        end_date (str): End date YYYY-MM-DD or YYYYMMDD (inclusive)
+        max_dte (Optional[int]): Only return contracts with DTE <= this value
+        num_strikes (Optional[int]): Number of strikes above/below ATM to return
+
+    Returns:
+        str: JSON with EOD option data including all Greeks (delta, gamma, theta, vega, rho, IV, vanna, charm, vomma, etc.)
+    """
+    try:
+        params = {
+            "symbol": symbol.upper(),
+            "expiration": expiration,
+            "strike": strike,
+            "right": right.lower(),
+            "start_date": start_date,
+            "end_date": end_date,
+            "max_dte": str(max_dte) if max_dte is not None else None,
+            "num_strikes": str(num_strikes) if num_strikes is not None else None,
+        }
+        rows = _theta_get("/v3/option/history/greeks/eod", params)
+        return json.dumps({
+            "symbol": symbol.upper(),
+            "right": right.lower(),
+            "expiration_filter": expiration,
+            "strike_filter": strike,
+            "start_date": start_date,
+            "end_date": end_date,
+            "record_count": len(rows),
+            "data": rows[:500],
+            "truncated": len(rows) > 500,
+        }, separators=(",", ":"))
+    except _requests.exceptions.ConnectionError:
+        return json.dumps({
+            "error": "Cannot connect to Theta Terminal at " + THETADATA_URL +
+                     ". Make sure the Theta Terminal v3 is running."
+        }, separators=(",", ":"))
+    except _requests.exceptions.HTTPError as e:
+        return json.dumps({"error": f"ThetaData API error: {str(e)}"}, separators=(",", ":"))
+    except Exception as e:
+        return json.dumps({"error": str(e)}, separators=(",", ":"))
 
 
 # ============================================================================

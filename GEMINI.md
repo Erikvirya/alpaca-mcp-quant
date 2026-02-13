@@ -240,3 +240,63 @@ strategy_code: |
 4. **For multi-symbol, use `dfs` dict for per-symbol access** — `dfs['AAPL']['Close']`.
 5. **Do NOT manually lag signals** — the sandbox handles look-ahead bias automatically.
 6. **Use IEX-compatible symbols** — major US equities and ETFs work. OTC/illiquid may not.
+
+---
+
+## ThetaData Options Tools (FREE historical EOD)
+
+These tools require the **Theta Terminal v3** running locally. It's a Java app that hosts a REST API on `http://127.0.0.1:25503`.
+
+### Setup (one-time)
+
+1. **Create a free account** at [thetadata.net/subscribe](https://www.thetadata.net/subscribe)
+2. **Install Java 21+** — download from [adoptium.net](https://adoptium.net/)
+3. **Download Theta Terminal v3** from [download-unstable.thetadata.us/ThetaTerminalv3.jar](https://download-unstable.thetadata.us/ThetaTerminalv3.jar)
+4. **Save your credentials** — create a file `thetadata.properties` next to the jar:
+   ```
+   username=your_email@example.com
+   password=your_password
+   ```
+
+### Launching the Theta Terminal
+
+Open a terminal and run:
+```
+java -jar ThetaTerminalv3.jar
+```
+
+Keep it running while using the tools. Verify it works by opening `http://127.0.0.1:25503/v3/option/list/expirations?symbol=AAPL` in your browser.
+
+To override the default URL, set the `THETADATA_URL` environment variable.
+
+### Available tools
+
+| Tool | Description |
+|---|---|
+| `get_theta_option_expirations(symbol)` | List all option expiration dates |
+| `get_theta_option_strikes(symbol, expiration)` | List strikes for a given expiration |
+| `get_theta_option_eod(symbol, expiration, strike, right, start_date, end_date)` | Historical EOD OHLCV + NBBO quote |
+| `get_theta_option_greeks_eod(symbol, expiration, strike, right, start_date, end_date)` | Historical EOD + all Greeks (delta, gamma, theta, vega, IV, etc.) |
+
+### Parameters
+
+- `symbol` — underlying (e.g., `"AAPL"`, `"SPY"`)
+- `expiration` — `"YYYY-MM-DD"` or `"YYYYMMDD"` or `"*"` for all
+- `strike` — price in dollars (e.g., `"170.000"`) or `"*"` for all
+- `right` — `"call"` or `"put"`
+- `start_date` / `end_date` — `"YYYY-MM-DD"` or `"YYYYMMDD"`
+- `max_dte` — optional, only contracts with DTE <= this value
+- `num_strikes` — optional, N strikes above/below ATM
+
+### Example prompts
+
+- "List all AAPL option expirations"
+- "Get SPY 550 call EOD with Greeks from 2026-01-01 to 2026-02-13"
+- "Show TSLA put option chain EOD, all strikes, expiring 2026-03-21, last 5 trading days"
+
+### Notes
+
+- EOD data is **FREE** — no paid subscription needed
+- Data is generated at **17:15 ET** each day
+- Results capped at **500 records** per call — use filters (`max_dte`, `num_strikes`, specific strike/expiration) to narrow
+- If Theta Terminal is not running, tools return a clear connection error

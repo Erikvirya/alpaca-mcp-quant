@@ -15,6 +15,12 @@ build/
 venv/
 .env.*
 
+# ThetaData credentials & runtime
+thetadata/creds.txt
+thetadata/ThetaTerminalv3.jar
+thetadata/lib/
+thetadata/config.toml
+
 # OS
 .DS_Store
 Thumbs.db
