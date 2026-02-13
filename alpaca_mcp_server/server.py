@@ -3254,7 +3254,12 @@ async def execute_options_backtest(
             return json.dumps({"error": {"message": "start date is required"}}, separators=(",", ":"))
 
         start_clean = start.strip().replace("-", "")
-        end_clean = end.strip().replace("-", "") if end else datetime.now(timezone.utc).strftime("%Y%m%d")
+        # Default end to yesterday — ThetaData rejects wildcard expiration for current-day,
+        # and EOD data isn't available until 17:15 ET anyway.
+        if end:
+            end_clean = end.strip().replace("-", "")
+        else:
+            end_clean = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y%m%d")
 
         start_dt = datetime.strptime(start_clean, "%Y%m%d").replace(tzinfo=timezone.utc)
         end_dt = datetime.strptime(end_clean, "%Y%m%d").replace(tzinfo=timezone.utc)
