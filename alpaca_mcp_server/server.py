@@ -1332,6 +1332,17 @@ async def execute_vectorbt_strategy(
 
         orig_from_signals = vbt.Portfolio.from_signals
 
+        # Direction string normalization: users may pass 'short' or 'long'
+        _direction_map = {
+            "short": "shortonly",
+            "long": "longonly",
+        }
+
+        def _normalize_direction(kwargs):
+            if "direction" in kwargs and isinstance(kwargs["direction"], str):
+                d = kwargs["direction"].lower().strip()
+                kwargs["direction"] = _direction_map.get(d, d)
+
         class _PortfolioProxy:
             @staticmethod
             def from_signals(close, entries, exits=None, *args, **kwargs):
@@ -1341,6 +1352,7 @@ async def execute_vectorbt_strategy(
                     kwargs["short_entries"] = _lag_one(kwargs.get("short_entries"))
                 if "short_exits" in kwargs:
                     kwargs["short_exits"] = _lag_one(kwargs.get("short_exits"))
+                _normalize_direction(kwargs)
                 # Derive exec_price that matches the shape of close
                 if pd is not None and isinstance(close, pd.DataFrame) and isinstance(open_prices, pd.DataFrame):
                     # Select only the columns present in close from open_prices
@@ -1357,7 +1369,25 @@ async def execute_vectorbt_strategy(
                     ep = open_prices
                 return orig_from_signals(ep, entries_lag, exits_lag, *args, **kwargs)
 
-            def __getattr__(self, name: str) -> Any:
+            @staticmethod
+            def from_orders(close, *args, **kwargs):
+                _normalize_direction(kwargs)
+                return vbt.Portfolio.from_orders(close, *args, **kwargs)
+
+            @staticmethod
+            def from_returns(*args, **kwargs):
+                return vbt.Portfolio.from_returns(*args, **kwargs)
+
+            @staticmethod
+            def from_holding(close, *args, **kwargs):
+                return vbt.Portfolio.from_holding(close, *args, **kwargs)
+
+            @staticmethod
+            def from_random_signals(close, *args, **kwargs):
+                _normalize_direction(kwargs)
+                return vbt.Portfolio.from_random_signals(close, *args, **kwargs)
+
+            def __class_getitem__(cls, name):
                 return getattr(vbt.Portfolio, name)
 
         class _VBTProxy:

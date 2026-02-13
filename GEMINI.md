@@ -232,6 +232,34 @@ strategy_code: |
 
 ---
 
+## Available Portfolio constructors
+
+All of these are available via `vbt.Portfolio.<method>`:
+
+- `vbt.Portfolio.from_signals(close, entries, exits, ...)` — signal-based (entries/exits are auto-lagged)
+- `vbt.Portfolio.from_orders(close, ...)` — order-based
+- `vbt.Portfolio.from_returns(returns, ...)` — returns-based
+- `vbt.Portfolio.from_holding(close, ...)` — buy-and-hold
+- `vbt.Portfolio.from_random_signals(close, ...)` — random signal generation
+
+### Direction parameter
+
+Use these string values for `direction=`:
+- `"longonly"` — long only (default)
+- `"shortonly"` — short only (NOT `"short"`)
+- `"both"` — both long and short
+
+For long+short strategies with `from_signals`, use `short_entries` and `short_exits` kwargs:
+```python
+pf = vbt.Portfolio.from_signals(
+    close, entries=long_entries, exits=long_exits,
+    short_entries=short_entries, short_exits=short_exits,
+    direction="both"
+)
+```
+
+---
+
 ## Common mistakes to avoid
 
 1. **Do NOT use import statements** — everything is pre-loaded.
@@ -240,6 +268,8 @@ strategy_code: |
 4. **For multi-symbol, use `dfs` dict for per-symbol access** — `dfs['AAPL']['Close']`.
 5. **Do NOT manually lag signals** — the sandbox handles look-ahead bias automatically.
 6. **Use IEX-compatible symbols** — major US equities and ETFs work. OTC/illiquid may not.
+7. **Direction strings** — use `"shortonly"` not `"short"`, `"longonly"` not `"long"`.
+8. **All Portfolio constructors are available** — `from_signals`, `from_orders`, `from_returns`, `from_holding`, `from_random_signals`.
 
 ---
 
