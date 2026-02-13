@@ -4,4 +4,6 @@ python-dotenv
 pandas
 numpy
 vectorbt
+statsmodels
+scipy
 click

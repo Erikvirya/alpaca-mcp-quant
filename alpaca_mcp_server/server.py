@@ -20,6 +20,9 @@ import re
 import sys
 import time
 import argparse
+import traceback
+import itertools
+import math
 from datetime import datetime, timedelta, date, timezone
 from typing import Dict, Any, List, Optional, Union
 from pathlib import Path
@@ -39,14 +42,34 @@ try:
 except Exception:
     vbt = None
 
+try:
+    import statsmodels
+    import statsmodels.api as sm
+    from statsmodels.tsa.stattools import coint, adfuller
+except Exception:
+    statsmodels = None
+    sm = None
+    coint = None
+    adfuller = None
+
+try:
+    import scipy
+    import scipy.stats as scipy_stats
+except Exception:
+    scipy = None
+    scipy_stats = None
+
 _BARS_DF_CACHE: Dict[str, Any] = {}
 _BARS_DF_CACHE_TTL_SECONDS = 300
 
 
-def _bars_cache_get(symbol: str, timeframe: str, limit: int) -> Any:
+def _bars_cache_get(symbol: str, timeframe: str, limit: int, start: Optional[str] = None, end: Optional[str] = None) -> Any:
     if pd is None:
         return None, False
-    key = f"{symbol}|{timeframe}|{int(limit)}"
+    # Include start/end in the key to differentiate data ranges
+    s_key = str(start) if start else "None"
+    e_key = str(end) if end else "None"
+    key = f"{symbol}|{timeframe}|{int(limit)}|{s_key}|{e_key}"
     entry = _BARS_DF_CACHE.get(key)
     if not entry:
         return None, False
@@ -64,13 +87,15 @@ def _bars_cache_get(symbol: str, timeframe: str, limit: int) -> Any:
         return None, False
 
 
-def _bars_cache_set(symbol: str, timeframe: str, limit: int, df: Any) -> None:
+def _bars_cache_set(symbol: str, timeframe: str, limit: int, df: Any, start: Optional[str] = None, end: Optional[str] = None) -> None:
     if pd is None:
         return
     if df is None:
         return
     try:
-        key = f"{symbol}|{timeframe}|{int(limit)}"
+        s_key = str(start) if start else "None"
+        e_key = str(end) if end else "None"
+        key = f"{symbol}|{timeframe}|{int(limit)}|{s_key}|{e_key}"
         _BARS_DF_CACHE[key] = {
             "expires_at": time.time() + float(_BARS_DF_CACHE_TTL_SECONDS),
             "df": df,
@@ -1001,7 +1026,32 @@ async def get_stock_bars(
         return f"Error fetching bars for {symbol_str}: {str(e)}"
 
 @mcp.tool()
-async def execute_vectorbt_strategy(symbol: str, strategy_code: str) -> str:
+async def execute_vectorbt_strategy(
+    symbol: Union[str, List[str]], 
+    strategy_code: str, 
+    timeframe: str = "1Day", 
+    start: Optional[str] = None, 
+    end: Optional[str] = None,
+    limit: int = 1000
+) -> str:
+    """
+    Executes a VectorBT strategy code against historical data for one or more symbols.
+
+    Args:
+        symbol (Union[str, List[str]]): Stock symbol(s) to backtest (e.g. 'AAPL' or ['AAPL', 'MSFT']).
+            Single symbol: `df` has flat columns (Open, High, Low, Close, Volume).
+            Multiple symbols: `df` has MultiIndex columns like df[('Close','AAPL')].
+                Also provides `dfs` dict: dfs['AAPL'] is a single-symbol DataFrame.
+        strategy_code (str): Python code using `df`, `vbt`, `pd`, `np` to define `pf = vbt.Portfolio...`.
+            For multi-symbol, also use `dfs` (dict of per-symbol DataFrames) and `symbols` (list of str).
+        timeframe (str): Bar timeframe (e.g. "1Day", "15Min", "1Hour"). Default "1Day".
+        start (Optional[str]): Start date ISO string (e.g. "2023-01-01").
+        end (Optional[str]): End date ISO string (e.g. "2023-12-31").
+        limit (int): Max number of bars if start/end not fully specified. Default 1000.
+
+    Returns:
+        JSON string containing stats, equity curve, and timings.
+    """
     _ensure_clients()
 
     def _json_safe_value(x: Any) -> Any:
@@ -1093,71 +1143,158 @@ async def execute_vectorbt_strategy(symbol: str, strategy_code: str) -> str:
                 separators=(",", ":"),
             )
 
-        # Friendly pre-check: reject import statements explicitly
-        if re.search(r"^\s*(import\s+|from\s+\S+\s+import\s+)", strategy_code, re.MULTILINE):
-            return json.dumps(
-                {
-                    "error": {
-                        "message": "Imports are disabled in strategy_code. Use only preloaded: df, vbt, pd, np.",
-                    }
-                },
+        # Normalize symbol to list
+        symbols = [symbol] if isinstance(symbol, str) else list(symbol)
+        is_multi = len(symbols) > 1
+
+        # Silently strip import lines — all libraries are already preloaded in the sandbox
+        strategy_code = re.sub(
+            r"^\s*(import\s+\S+.*|from\s+\S+\s+import\s+.*)$",
+            "# (import stripped — already preloaded)",
+            strategy_code,
+            flags=re.MULTILINE,
+        )
+
+        # Parse timeframe
+        timeframe_obj = parse_timeframe_with_enums(timeframe)
+        if timeframe_obj is None:
+             return json.dumps(
+                {"error": {"message": f"Invalid timeframe: {timeframe}"}},
                 separators=(",", ":"),
             )
+        
+        # Determine start/end datetimes
+        start_dt = None
+        if start:
+            try:
+                start_dt = _parse_iso_datetime(start)
+            except ValueError:
+                 return json.dumps(
+                    {"error": {"message": f"Invalid start date: {start}"}},
+                    separators=(",", ":"),
+                )
 
-        timeframe_str = "1Day"
-        bar_limit = 1000
-
+        end_dt = None
+        if end:
+            try:
+                end_dt = _parse_iso_datetime(end)
+            except ValueError:
+                 return json.dumps(
+                    {"error": {"message": f"Invalid end date: {end}"}},
+                    separators=(",", ":"),
+                )
+        
+        # Cache key uses sorted symbols string for consistency
+        cache_key_sym = ",".join(sorted(symbols))
         t_cache_start = time.perf_counter()
-        df, cache_hit = _bars_cache_get(symbol, timeframe_str, bar_limit)
+        df, cache_hit = _bars_cache_get(cache_key_sym, timeframe, limit, start, end)
         timings_ms["cache_lookup"] = int((time.perf_counter() - t_cache_start) * 1000)
 
         if not cache_hit:
             now_utc = datetime.now(timezone.utc)
             t_bars_start = time.perf_counter()
+            
+            # If end is not provided, we default to now for the request to ensure we get latest data
+            req_end = end_dt if end_dt else now_utc
+
+            # If start is not provided, default to a reasonable lookback based on limit+timeframe
+            if start_dt is None:
+                unit = timeframe_obj.unit
+                amount = timeframe_obj.amount
+                if unit == TimeFrameUnit.Day:
+                    start_dt = req_end - timedelta(days=int(limit * amount * 1.5))
+                elif unit == TimeFrameUnit.Hour:
+                    start_dt = req_end - timedelta(hours=int(limit * amount * 1.5))
+                elif unit == TimeFrameUnit.Minute:
+                    start_dt = req_end - timedelta(minutes=int(limit * amount * 1.5))
+                elif unit == TimeFrameUnit.Week:
+                    start_dt = req_end - timedelta(weeks=int(limit * amount * 1.5))
+                elif unit == TimeFrameUnit.Month:
+                    start_dt = req_end - timedelta(days=int(limit * amount * 45))
+                else:
+                    start_dt = req_end - timedelta(days=int(limit * 2))
 
             request_params = StockBarsRequest(
-                symbol_or_symbols=[symbol],
-                timeframe=TimeFrame.Day,
-                start=None,
-                end=now_utc,
-                limit=bar_limit,
+                symbol_or_symbols=symbols,
+                timeframe=timeframe_obj,
+                start=start_dt,
+                end=req_end,
+                limit=limit,
                 sort=Sort.DESC,
+                feed=DataFeed.IEX,
             )
 
             bars = stock_historical_data_client.get_stock_bars(request_params)
             timings_ms["alpaca_bars_fetch"] = int((time.perf_counter() - t_bars_start) * 1000)
 
-            bar_list = bars[symbol] if bars and symbol in bars and bars[symbol] else []
-            if not bar_list:
+            t_df_start = time.perf_counter()
+
+            # Build per-symbol DataFrames
+            per_sym_dfs: Dict[str, Any] = {}
+            missing_syms = []
+            for sym in symbols:
+                try:
+                    bar_list = bars[sym] if bars[sym] else []
+                except (KeyError, TypeError):
+                    bar_list = []
+                if not bar_list:
+                    missing_syms.append(sym)
+                    continue
+                rows = []
+                for bar in bar_list:
+                    rows.append(
+                        {
+                            "timestamp": bar.timestamp,
+                            "Open": bar.open,
+                            "High": bar.high,
+                            "Low": bar.low,
+                            "Close": bar.close,
+                            "Volume": bar.volume,
+                        }
+                    )
+                sym_df = pd.DataFrame(rows)
+                sym_df["timestamp"] = pd.to_datetime(sym_df["timestamp"], utc=True)
+                sym_df = sym_df.set_index("timestamp").sort_index()
+                per_sym_dfs[sym] = sym_df
+
+            if not per_sym_dfs:
                 return json.dumps(
-                    {"error": {"message": f"No bar data found for {symbol}"}},
+                    {"error": {"message": f"No bar data found for {', '.join(symbols)}"}},
                     separators=(",", ":"),
                 )
 
-            t_df_start = time.perf_counter()
-            rows = []
-            for bar in bar_list:
-                rows.append(
-                    {
-                        "timestamp": bar.timestamp,
-                        "open": bar.open,
-                        "high": bar.high,
-                        "low": bar.low,
-                        "close": bar.close,
-                        "volume": bar.volume,
-                    }
-                )
-            df = pd.DataFrame(rows)
-            if "timestamp" not in df.columns:
-                return json.dumps(
-                    {"error": {"message": "Unexpected bars format: missing timestamp"}},
-                    separators=(",", ":"),
-                )
-            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-            df = df.set_index("timestamp").sort_index()
+            if missing_syms:
+                timings_ms["missing_symbols"] = missing_syms
+
+            if is_multi:
+                # Build MultiIndex columns DataFrame: (field, symbol)
+                panels = {}
+                for sym, sym_df in per_sym_dfs.items():
+                    for col in sym_df.columns:
+                        panels[(col, sym)] = sym_df[col]
+                df = pd.DataFrame(panels)
+                df.columns = pd.MultiIndex.from_tuples(df.columns, names=["field", "symbol"])
+            else:
+                # Single symbol: flat columns (backward compatible)
+                df = per_sym_dfs[symbols[0]]
+
             timings_ms["df_build"] = int((time.perf_counter() - t_df_start) * 1000)
 
-            _bars_cache_set(symbol, timeframe_str, bar_limit, df)
+            _bars_cache_set(cache_key_sym, timeframe, limit, df, start, end)
+
+        # Build dfs convenience dict and filter symbols to only those with data
+        if is_multi:
+            dfs: Dict[str, Any] = {}
+            for sym in symbols:
+                try:
+                    dfs[sym] = df.xs(sym, level="symbol", axis=1)
+                except KeyError:
+                    pass
+            # symbols in sandbox = only symbols with actual data
+            available_symbols = list(dfs.keys())
+        else:
+            dfs = {symbols[0]: df}
+            available_symbols = symbols
 
         def _lag_one(x: Any) -> Any:
             if x is None:
@@ -1174,7 +1311,8 @@ async def execute_vectorbt_strategy(symbol: str, strategy_code: str) -> str:
                 return [False] + [bool(v) for v in x[:-1]]
             return x
 
-        exec_price = df["open"]
+        # open_prices: full Open data for deriving exec_price dynamically
+        open_prices = df["Open"]
 
         orig_from_signals = vbt.Portfolio.from_signals
 
@@ -1187,7 +1325,21 @@ async def execute_vectorbt_strategy(symbol: str, strategy_code: str) -> str:
                     kwargs["short_entries"] = _lag_one(kwargs.get("short_entries"))
                 if "short_exits" in kwargs:
                     kwargs["short_exits"] = _lag_one(kwargs.get("short_exits"))
-                return orig_from_signals(exec_price, entries_lag, exits_lag, *args, **kwargs)
+                # Derive exec_price that matches the shape of close
+                if pd is not None and isinstance(close, pd.DataFrame) and isinstance(open_prices, pd.DataFrame):
+                    # Select only the columns present in close from open_prices
+                    shared_cols = [c for c in close.columns if c in open_prices.columns]
+                    ep = open_prices[shared_cols] if shared_cols else open_prices
+                elif pd is not None and isinstance(close, pd.Series) and isinstance(open_prices, pd.DataFrame):
+                    # Strategy passed a single series; try to match by name
+                    if close.name and close.name in open_prices.columns:
+                        ep = open_prices[close.name]
+                    else:
+                        # Fallback: use first column
+                        ep = open_prices.iloc[:, 0]
+                else:
+                    ep = open_prices
+                return orig_from_signals(ep, entries_lag, exits_lag, *args, **kwargs)
 
             def __getattr__(self, name: str) -> Any:
                 return getattr(vbt.Portfolio, name)
@@ -1207,6 +1359,17 @@ async def execute_vectorbt_strategy(symbol: str, strategy_code: str) -> str:
             "range": range,
             "enumerate": enumerate,
             "zip": zip,
+            "sorted": sorted,
+            "reversed": reversed,
+            "round": round,
+            "map": map,
+            "filter": filter,
+            "any": any,
+            "all": all,
+            "isinstance": isinstance,
+            "hasattr": hasattr,
+            "getattr": getattr,
+            "print": print,
             "float": float,
             "int": int,
             "str": str,
@@ -1215,14 +1378,26 @@ async def execute_vectorbt_strategy(symbol: str, strategy_code: str) -> str:
             "dict": dict,
             "set": set,
             "tuple": tuple,
+            "slice": slice,
         }
 
         sandbox: Dict[str, Any] = {
             "__builtins__": allowed_builtins,
             "df": df,
+            "dfs": dfs,
+            "symbols": available_symbols,
+            "all_requested_symbols": symbols,
             "vbt": _VBTProxy(),
             "pd": pd,
             "np": np,
+            "sm": sm,
+            "statsmodels": statsmodels,
+            "coint": coint,
+            "adfuller": adfuller,
+            "scipy": scipy,
+            "scipy_stats": scipy_stats,
+            "itertools": itertools,
+            "math": math,
         }
 
         t_exec_start = time.perf_counter()
@@ -1258,17 +1433,35 @@ async def execute_vectorbt_strategy(symbol: str, strategy_code: str) -> str:
         cum_returns = equity.pct_change().fillna(0).add(1).cumprod().sub(1)
         cum_return_points = _series_to_points(cum_returns, "r")
 
-        close = df["close"]
-        benchmark_cum_returns = close.pct_change().fillna(0).add(1).cumprod().sub(1)
-        benchmark_points = _series_to_points(benchmark_cum_returns, "r")
+        # Benchmark: for multi-symbol use equal-weighted average of close prices
+        if is_multi:
+            close_df = df["Close"]  # DataFrame with symbol columns
+            # Equal-weighted benchmark: average pct_change across symbols
+            pct = close_df.pct_change().fillna(0)
+            avg_pct = pct.mean(axis=1)
+            benchmark_cum_returns = avg_pct.add(1).cumprod().sub(1)
+            benchmark_points = _series_to_points(benchmark_cum_returns, "r")
+            # Per-symbol benchmark
+            per_sym_benchmark = {}
+            for sym in close_df.columns:
+                sym_cum = close_df[sym].pct_change().fillna(0).add(1).cumprod().sub(1)
+                per_sym_benchmark[sym] = _series_to_points(sym_cum, "r")
+        else:
+            close = df["Close"]
+            benchmark_cum_returns = close.pct_change().fillna(0).add(1).cumprod().sub(1)
+            benchmark_points = _series_to_points(benchmark_cum_returns, "r")
+            per_sym_benchmark = None
         timings_ms["timeseries"] = int((time.perf_counter() - t_ts_start) * 1000)
 
         timings_ms["total"] = int((time.perf_counter() - t0) * 1000)
 
         payload = {
-            "symbol": symbol,
-            "timeframe": timeframe_str,
+            "symbol": available_symbols if is_multi else symbols[0],
+            "symbols_requested": len(symbols),
+            "symbols_loaded": len(available_symbols),
+            "timeframe": timeframe,
             "bar_count": int(len(df)),
+            "multi_symbol": is_multi,
             "cache_hit": bool(cache_hit),
             "timings_ms": {str(k): _json_safe_value(v) for k, v in timings_ms.items()},
             "stats": stats_dict,
@@ -1276,6 +1469,8 @@ async def execute_vectorbt_strategy(symbol: str, strategy_code: str) -> str:
             "cum_returns": cum_return_points,
             "benchmark_cum_returns": benchmark_points,
         }
+        if per_sym_benchmark:
+            payload["per_symbol_benchmark"] = per_sym_benchmark
         return json.dumps(payload, separators=(",", ":"))
 
     except Exception as e:
