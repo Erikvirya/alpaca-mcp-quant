@@ -1330,7 +1330,8 @@ async def execute_vectorbt_strategy(
         # open_prices: full Open data for deriving exec_price dynamically
         open_prices = df["Open"]
 
-        orig_from_signals = vbt.Portfolio.from_signals
+        _real_portfolio = vbt.Portfolio
+        orig_from_signals = _real_portfolio.from_signals
 
         # Direction string normalization: users may pass 'short' or 'long'
         _direction_map = {
@@ -1372,23 +1373,23 @@ async def execute_vectorbt_strategy(
             @staticmethod
             def from_orders(close, *args, **kwargs):
                 _normalize_direction(kwargs)
-                return vbt.Portfolio.from_orders(close, *args, **kwargs)
+                return _real_portfolio.from_orders(close, *args, **kwargs)
 
             @staticmethod
             def from_returns(*args, **kwargs):
-                return vbt.Portfolio.from_returns(*args, **kwargs)
+                return _real_portfolio.from_returns(*args, **kwargs)
 
             @staticmethod
             def from_holding(close, *args, **kwargs):
-                return vbt.Portfolio.from_holding(close, *args, **kwargs)
+                return _real_portfolio.from_holding(close, *args, **kwargs)
 
             @staticmethod
             def from_random_signals(close, *args, **kwargs):
                 _normalize_direction(kwargs)
-                return vbt.Portfolio.from_random_signals(close, *args, **kwargs)
+                return _real_portfolio.from_random_signals(close, *args, **kwargs)
 
             def __class_getitem__(cls, name):
-                return getattr(vbt.Portfolio, name)
+                return getattr(_real_portfolio, name)
 
         class _VBTProxy:
             Portfolio = _PortfolioProxy
