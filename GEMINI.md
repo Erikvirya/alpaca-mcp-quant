@@ -330,3 +330,167 @@ To override the default URL, set the `THETADATA_URL` environment variable.
 - Data is generated at **17:15 ET** each day
 - Results capped at **500 records** per call — use filters (`max_dte`, `num_strikes`, specific strike/expiration) to narrow
 - If Theta Terminal is not running, tools return a clear connection error
+
+---
+
+## execute_options_backtest — Full Reference
+
+Backtest **real options strategies** using ThetaData EOD option prices + Greeks combined with Alpaca underlying data. Requires Theta Terminal v3 running locally.
+
+### Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `symbol` | `str` | required | Underlying symbol (e.g., `"SPY"`, `"AAPL"`) |
+| `strategy_code` | `str` | required | Python code that defines `pf` (a VectorBT Portfolio) |
+| `start` | `str` | required | Start date `"YYYY-MM-DD"` |
+| `end` | `str` | `""` (today) | End date `"YYYY-MM-DD"` |
+| `right` | `str` | `"both"` | `"call"`, `"put"`, or `"both"` |
+| `max_dte` | `int` | `60` | Max days-to-expiration to include |
+| `strike_count` | `int` | `15` | Number of strikes above/below ATM to fetch |
+
+### Sandbox Variables
+
+| Variable | Type | Description |
+|----------|------|-------------|
+| `df` | `pd.DataFrame` | Underlying OHLCV (Open/High/Low/Close/Volume), DatetimeIndex |
+| `chain` | `pd.DataFrame` | Flat DataFrame of ALL option records (see columns below) |
+| `symbol` | `str` | The underlying symbol |
+| `vbt` | vectorbt | VectorBT library (with Portfolio proxy) |
+| `pd`, `np` | libraries | pandas, numpy |
+| `sm`, `statsmodels`, `scipy`, `scipy_stats`, `math`, `itertools` | libraries | Same as equity sandbox |
+
+### `chain` DataFrame columns
+
+`date`, `expiration`, `strike`, `right` (C/P), `open`, `high`, `low`, `close`, `volume`, `bid`, `ask`, `delta`, `gamma`, `theta`, `vega`, `rho`, `iv`, `dte`, `underlying_close`
+
+- `date` and `expiration` are `pd.Timestamp`
+- `strike` is in dollars (auto-normalized from ThetaData thousandths)
+- `dte` is computed as `(expiration - date).days`
+
+### Helper Functions
+
+| Function | Description |
+|----------|-------------|
+| `get_chain_on_date(date, right=None, min_dte=None, max_dte=None)` | Option chain snapshot for a specific date |
+| `nearest_expiry(date, min_dte=20, max_dte=45)` | Find nearest expiration with DTE in range → `Timestamp` or `None` |
+| `get_by_delta(date, expiration, target_delta, right='C')` | Find contract closest to target delta → `Series` or `None` |
+| `get_atm(date, expiration, right='C')` | Get ATM contract → `Series` or `None` |
+| `get_contract(date, expiration, strike, right='C')` | Get specific contract row → `Series` or `None` |
+| `get_contract_series(expiration, strike, right='C')` | Full time series for one contract → `DataFrame` |
+
+### Strategy Examples
+
+#### 1. Sell 30-delta put, roll at 21 DTE
+
+```
+symbol: "SPY"
+start: "2025-06-01"
+end: "2026-02-01"
+strategy_code: |
+  dates = sorted(chain['date'].unique())
+  pnl = pd.Series(0.0, index=range(len(dates)))
+  position = None
+
+  for i, dt in enumerate(dates):
+      if position is not None:
+          cur = get_contract(dt, position['exp'], position['strike'], 'P')
+          if cur is not None:
+              pnl.iloc[i] = position['entry'] - cur['close']  # short put P&L
+              if cur['dte'] <= 21 or (position['entry'] - cur['close']) > position['entry'] * 0.5:
+                  position = None  # close and re-open below
+
+      if position is None:
+          exp = nearest_expiry(dt, min_dte=30, max_dte=50)
+          if exp is not None:
+              contract = get_by_delta(dt, exp, -0.30, 'P')
+              if contract is not None:
+                  position = {'exp': exp, 'strike': contract['strike'], 'entry': contract['close']}
+
+  pf = vbt.Portfolio.from_returns(pnl / 10000, init_cash=10000, freq='1D')
+```
+
+#### 2. Buy ATM straddle on high IV days
+
+```
+symbol: "AAPL"
+start: "2025-06-01"
+end: "2026-01-15"
+right: "both"
+strategy_code: |
+  dates = sorted(chain['date'].unique())
+  returns = []
+
+  for i, dt in enumerate(dates[:-1]):
+      exp = nearest_expiry(dt, min_dte=25, max_dte=40)
+      if exp is None:
+          returns.append(0.0)
+          continue
+      call = get_atm(dt, exp, 'C')
+      put = get_atm(dt, exp, 'P')
+      if call is None or put is None:
+          returns.append(0.0)
+          continue
+
+      # Only enter if IV > 30%
+      avg_iv = (call['iv'] + put['iv']) / 2
+      if avg_iv < 0.30:
+          returns.append(0.0)
+          continue
+
+      # Next day P&L
+      next_dt = dates[i + 1]
+      call_next = get_contract(next_dt, exp, call['strike'], 'C')
+      put_next = get_contract(next_dt, exp, put['strike'], 'P')
+      if call_next is None or put_next is None:
+          returns.append(0.0)
+          continue
+      cost = call['close'] + put['close']
+      value = call_next['close'] + put_next['close']
+      returns.append((value - cost) / cost if cost > 0 else 0.0)
+
+  pf = vbt.Portfolio.from_returns(pd.Series(returns), init_cash=10000, freq='1D')
+```
+
+#### 3. Covered call (underlying + short OTM call)
+
+```
+symbol: "SPY"
+start: "2025-06-01"
+end: "2026-02-01"
+right: "call"
+strategy_code: |
+  dates = sorted(chain['date'].unique())
+  close = df['Close']
+  underlying_ret = close.pct_change().fillna(0)
+
+  call_pnl = pd.Series(0.0, index=close.index)
+  position = None
+
+  for dt in dates:
+      if position is not None:
+          cur = get_contract(dt, position['exp'], position['strike'], 'C')
+          if cur is None or cur['dte'] <= 7:
+              position = None
+          else:
+              call_pnl.loc[dt] = position['entry'] - cur['close']
+
+      if position is None:
+          exp = nearest_expiry(dt, min_dte=25, max_dte=40)
+          if exp:
+              contract = get_by_delta(dt, exp, 0.20, 'C')
+              if contract is not None:
+                  position = {'exp': exp, 'strike': contract['strike'], 'entry': contract['close']}
+
+  total_ret = underlying_ret + call_pnl / (close.shift(1).fillna(close.iloc[0]))
+  pf = vbt.Portfolio.from_returns(total_ret.dropna(), init_cash=10000, freq='1D')
+```
+
+### Common mistakes (options backtest)
+
+1. **`start` is required** — unlike `execute_vectorbt_strategy`, you must specify a start date.
+2. **Theta Terminal must be running** — launch it before calling the tool.
+3. **Helpers return `None` if no data** — always check for `None` before accessing fields.
+4. **`chain` dates are `pd.Timestamp`** — compare with `pd.Timestamp('2025-06-01')`, not strings.
+5. **`right` in chain is `'C'` or `'P'`** — uppercase single character.
+6. **No import statements needed** — everything is pre-loaded.

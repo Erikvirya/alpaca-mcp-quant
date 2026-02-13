@@ -3149,6 +3149,436 @@ async def get_theta_option_greeks_eod(
 
 
 # ============================================================================
+# Options Backtesting Tool (ThetaData + VectorBT)
+# ============================================================================
+
+@mcp.tool()
+async def execute_options_backtest(
+    symbol: str,
+    strategy_code: str,
+    start: str,
+    end: str = "",
+    right: str = "both",
+    max_dte: int = 60,
+    strike_count: int = 15,
+) -> str:
+    """
+    Backtest options strategies using real EOD option prices and Greeks from ThetaData,
+    combined with underlying OHLCV from Alpaca.  Requires the Theta Terminal v3 running
+    locally (java -jar ThetaTerminalv3.jar).
+
+    The sandbox provides:
+      df        – underlying OHLCV DataFrame (Open/High/Low/Close/Volume)
+      chain     – flat DataFrame of ALL option records (date, expiration, strike, right,
+                  open, high, low, close, volume, bid, ask, delta, gamma, theta, vega,
+                  rho, iv, dte, underlying_close …)
+      symbol    – the underlying symbol string
+    Helper functions:
+      get_chain_on_date(date, right=None, min_dte=None, max_dte=None)
+      nearest_expiry(date, min_dte=20, max_dte=45)
+      get_by_delta(date, expiration, target_delta, right='C')
+      get_atm(date, expiration, right='C')
+      get_contract(date, expiration, strike, right='C')
+      get_contract_series(expiration, strike, right='C')
+    Libraries: vbt, pd, np, sm, statsmodels, scipy, scipy_stats, math, itertools
+
+    Args:
+        symbol (str): Underlying symbol (e.g., 'SPY', 'AAPL')
+        strategy_code (str): Python code that defines `pf` (a VectorBT Portfolio)
+        start (str): Start date YYYY-MM-DD (required)
+        end (str): End date YYYY-MM-DD (default: today)
+        right (str): 'call', 'put', or 'both' (default: 'both')
+        max_dte (int): Max days-to-expiration to include (default: 60)
+        strike_count (int): Strikes above/below ATM to fetch (default: 15)
+
+    Returns:
+        str: JSON with backtest stats, equity curve, chain metadata, and timings
+    """
+    # ── json-safe helpers (same as execute_vectorbt_strategy) ──
+    def _json_safe_value(x: Any) -> Any:
+        try:
+            if x is None:
+                return None
+            if isinstance(x, (str, bool, int)):
+                return x
+            if isinstance(x, float):
+                if math.isfinite(x):
+                    return x
+                return None
+            if np is not None and isinstance(x, (np.floating, np.integer)):
+                return _json_safe_value(x.item())
+            if pd is not None:
+                if isinstance(x, (pd.Timestamp, datetime, date)):
+                    return x.isoformat() if not isinstance(x, pd.Timestamp) else x.to_pydatetime().isoformat()
+                if isinstance(x, pd.Timedelta):
+                    return x.total_seconds()
+                if isinstance(x, pd.Series):
+                    return {str(k): _json_safe_value(v) for k, v in x.to_dict().items()}
+                if isinstance(x, pd.DataFrame):
+                    return x.to_dict(orient="list")
+            if isinstance(x, (list, tuple)):
+                return [_json_safe_value(v) for v in x]
+            if isinstance(x, dict):
+                return {str(k): _json_safe_value(v) for k, v in x.items()}
+            return str(x)
+        except Exception:
+            return str(x)
+
+    def _series_to_points(series: Any, value_key: str) -> List[Dict[str, Any]]:
+        if pd is None or series is None:
+            return []
+        s = series
+        if hasattr(s, "dropna"):
+            s = s.dropna()
+        points: List[Dict[str, Any]] = []
+        try:
+            for idx, val in s.items():
+                t = idx.isoformat() if isinstance(idx, (pd.Timestamp, datetime)) else str(idx)
+                points.append({"t": t, value_key: _json_safe_value(val)})
+        except Exception:
+            return []
+        return points
+
+    try:
+        t0 = time.perf_counter()
+        timings_ms: Dict[str, Any] = {}
+
+        # Strip imports
+        strategy_code = re.sub(
+            r"^\s*(import\s+\w+|from\s+\w+\s+import\s+.*)\s*$", "",
+            strategy_code, flags=re.MULTILINE,
+        )
+
+        symbol = symbol.upper().strip()
+        if not start:
+            return json.dumps({"error": {"message": "start date is required"}}, separators=(",", ":"))
+
+        start_clean = start.strip().replace("-", "")
+        end_clean = end.strip().replace("-", "") if end else datetime.now(timezone.utc).strftime("%Y%m%d")
+
+        start_dt = datetime.strptime(start_clean, "%Y%m%d").replace(tzinfo=timezone.utc)
+        end_dt = datetime.strptime(end_clean, "%Y%m%d").replace(tzinfo=timezone.utc)
+
+        # ── 1. Fetch underlying OHLCV from Alpaca ──
+        t_underlying = time.perf_counter()
+        _ensure_clients()
+        request_params = StockBarsRequest(
+            symbol_or_symbols=[symbol],
+            timeframe=TimeFrame.Day,
+            start=start_dt,
+            end=end_dt,
+            feed=DataFeed.IEX,
+        )
+        bars = stock_historical_data_client.get_stock_bars(request_params)
+        bar_list = []
+        try:
+            bar_list = bars[symbol] if bars[symbol] else []
+        except (KeyError, TypeError):
+            bar_list = []
+        if not bar_list:
+            return json.dumps({"error": {"message": f"No underlying bar data for {symbol}"}}, separators=(",", ":"))
+
+        rows_u = [{"timestamp": b.timestamp, "Open": b.open, "High": b.high,
+                    "Low": b.low, "Close": b.close, "Volume": b.volume} for b in bar_list]
+        underlying_df = pd.DataFrame(rows_u)
+        underlying_df["timestamp"] = pd.to_datetime(underlying_df["timestamp"], utc=True)
+        underlying_df = underlying_df.set_index("timestamp").sort_index()
+        timings_ms["underlying_fetch"] = int((time.perf_counter() - t_underlying) * 1000)
+
+        # ── 2. Fetch option chain + Greeks from ThetaData ──
+        t_chain_start = time.perf_counter()
+        if right.lower() == "both":
+            rights_list = ["C", "P"]
+        elif right.lower().startswith("c"):
+            rights_list = ["C"]
+        else:
+            rights_list = ["P"]
+
+        all_chain_rows: list = []
+        fetch_errors: list = []
+        for r in rights_list:
+            try:
+                rows = _theta_get("/v3/option/history/greeks/eod", {
+                    "symbol": symbol, "expiration": "*", "strike": "*",
+                    "right": r, "start_date": start_clean, "end_date": end_clean,
+                    "max_dte": str(max_dte), "num_strikes": str(strike_count),
+                })
+                all_chain_rows.extend(rows)
+            except _requests.exceptions.ConnectionError:
+                return json.dumps({
+                    "error": "Cannot connect to Theta Terminal at " + THETADATA_URL +
+                             ". Make sure the Theta Terminal v3 is running."
+                }, separators=(",", ":"))
+            except Exception as e:
+                fetch_errors.append(f"{r}: {str(e)}")
+
+        if not all_chain_rows:
+            msg = f"No option chain data returned from ThetaData for {symbol}"
+            if fetch_errors:
+                msg += f". Errors: {'; '.join(fetch_errors)}"
+            return json.dumps({"error": {"message": msg}}, separators=(",", ":"))
+
+        chain = pd.DataFrame(all_chain_rows)
+
+        # Normalize column names
+        col_map = {}
+        for c in chain.columns:
+            cl = c.lower().strip()
+            if cl == "implied_volatility":
+                col_map[c] = "iv"
+            elif cl == "bid_eod":
+                col_map[c] = "bid"
+            elif cl == "ask_eod":
+                col_map[c] = "ask"
+            elif cl == "underlying_price":
+                col_map[c] = "underlying_close"
+        if col_map:
+            chain = chain.rename(columns=col_map)
+
+        # Strike normalization (ThetaData may report in thousandths)
+        if "strike" in chain.columns and len(chain) > 0 and chain["strike"].max() > 10000:
+            chain["strike"] = chain["strike"] / 1000.0
+
+        # Parse date / expiration from YYYYMMDD int → datetime
+        if "date" in chain.columns:
+            chain["date"] = pd.to_datetime(chain["date"].astype(str), format="%Y%m%d")
+        if "expiration" in chain.columns:
+            chain["expiration"] = pd.to_datetime(chain["expiration"].astype(str), format="%Y%m%d")
+
+        # Compute DTE
+        if "date" in chain.columns and "expiration" in chain.columns:
+            chain["dte"] = (chain["expiration"] - chain["date"]).dt.days
+
+        timings_ms["chain_fetch"] = int((time.perf_counter() - t_chain_start) * 1000)
+        timings_ms["chain_records"] = len(chain)
+
+        # ── 3. Helper functions for the sandbox ──
+        def get_chain_on_date(dt, right=None, min_dte=None, max_dte=None):
+            """Option chain snapshot for a specific date."""
+            if isinstance(dt, str):
+                dt = pd.Timestamp(dt)
+            mask = chain["date"] == dt
+            if right:
+                mask &= chain["right"] == right.upper()
+            if min_dte is not None:
+                mask &= chain["dte"] >= min_dte
+            if max_dte is not None:
+                mask &= chain["dte"] <= max_dte
+            return chain[mask].copy()
+
+        def nearest_expiry(dt, min_dte=20, max_dte=45):
+            """Find nearest expiration with DTE in range. Returns Timestamp or None."""
+            snap = get_chain_on_date(dt, min_dte=min_dte, max_dte=max_dte)
+            if snap.empty:
+                return None
+            return snap.sort_values("dte")["expiration"].iloc[0]
+
+        def get_by_delta(dt, expiration, target_delta, right="C"):
+            """Find contract closest to target delta. Returns Series or None."""
+            snap = get_chain_on_date(dt)
+            if isinstance(expiration, str):
+                expiration = pd.Timestamp(expiration)
+            mask = (snap["expiration"] == expiration) & (snap["right"] == right.upper())
+            cands = snap[mask]
+            if cands.empty or "delta" not in cands.columns:
+                return None
+            idx = (cands["delta"] - target_delta).abs().idxmin()
+            return cands.loc[idx]
+
+        def get_atm(dt, expiration, right="C"):
+            """Get ATM contract for date and expiration. Returns Series or None."""
+            snap = get_chain_on_date(dt)
+            if isinstance(expiration, str):
+                expiration = pd.Timestamp(expiration)
+            mask = (snap["expiration"] == expiration) & (snap["right"] == right.upper())
+            cands = snap[mask]
+            if cands.empty:
+                return None
+            if "underlying_close" in cands.columns:
+                ul = cands["underlying_close"].iloc[0]
+            else:
+                try:
+                    if isinstance(dt, str):
+                        dt = pd.Timestamp(dt)
+                    loc = underlying_df.index.get_indexer([dt], method="nearest")[0]
+                    ul = underlying_df.iloc[loc]["Close"]
+                except Exception:
+                    return None
+            idx = (cands["strike"] - ul).abs().idxmin()
+            return cands.loc[idx]
+
+        def get_contract(dt, expiration, strike, right="C"):
+            """Get specific contract row for a date. Returns Series or None."""
+            snap = get_chain_on_date(dt)
+            if isinstance(expiration, str):
+                expiration = pd.Timestamp(expiration)
+            mask = ((snap["expiration"] == expiration) &
+                    (snap["strike"] == strike) &
+                    (snap["right"] == right.upper()))
+            result = snap[mask]
+            return result.iloc[0] if not result.empty else None
+
+        def get_contract_series(expiration, strike, right="C"):
+            """Full time series for a specific contract. Returns DataFrame."""
+            if isinstance(expiration, str):
+                expiration = pd.Timestamp(expiration)
+            mask = ((chain["expiration"] == expiration) &
+                    (chain["strike"] == strike) &
+                    (chain["right"] == right.upper()))
+            result = chain[mask].copy()
+            if "date" in result.columns:
+                result = result.set_index("date").sort_index()
+            return result
+
+        # ── 4. Sandbox ──
+        _real_portfolio = vbt.Portfolio
+
+        _dir_map = {"short": "shortonly", "long": "longonly"}
+
+        def _norm_dir(kw):
+            if "direction" in kw and isinstance(kw["direction"], str):
+                kw["direction"] = _dir_map.get(kw["direction"].lower().strip(), kw["direction"])
+
+        class _OptPfProxy:
+            @staticmethod
+            def from_signals(close, entries, exits=None, *a, **kw):
+                _norm_dir(kw)
+                return _real_portfolio.from_signals(close, entries, exits, *a, **kw)
+
+            @staticmethod
+            def from_orders(close, *a, **kw):
+                _norm_dir(kw)
+                return _real_portfolio.from_orders(close, *a, **kw)
+
+            @staticmethod
+            def from_returns(*a, **kw):
+                return _real_portfolio.from_returns(*a, **kw)
+
+            @staticmethod
+            def from_holding(close, *a, **kw):
+                return _real_portfolio.from_holding(close, *a, **kw)
+
+            @staticmethod
+            def from_random_signals(close, *a, **kw):
+                _norm_dir(kw)
+                return _real_portfolio.from_random_signals(close, *a, **kw)
+
+            def __class_getitem__(cls, name):
+                return getattr(_real_portfolio, name)
+
+        class _OptVBTProxy:
+            Portfolio = _OptPfProxy
+            def __getattr__(self, name):
+                return getattr(vbt, name)
+
+        allowed_builtins = {
+            "abs": abs, "min": min, "max": max, "sum": sum, "len": len,
+            "range": range, "enumerate": enumerate, "zip": zip,
+            "sorted": sorted, "reversed": reversed, "round": round,
+            "map": map, "filter": filter, "any": any, "all": all,
+            "isinstance": isinstance, "hasattr": hasattr, "getattr": getattr,
+            "print": print, "float": float, "int": int, "str": str,
+            "bool": bool, "list": list, "dict": dict, "set": set,
+            "tuple": tuple, "slice": slice,
+        }
+
+        sandbox: Dict[str, Any] = {
+            "__builtins__": allowed_builtins,
+            "df": underlying_df,
+            "chain": chain,
+            "symbol": symbol,
+            "vbt": _OptVBTProxy(),
+            "pd": pd,
+            "np": np,
+            "sm": sm,
+            "statsmodels": statsmodels,
+            "scipy": scipy,
+            "scipy_stats": scipy_stats,
+            "math": math,
+            "itertools": itertools,
+            # Helper functions
+            "get_chain_on_date": get_chain_on_date,
+            "nearest_expiry": nearest_expiry,
+            "get_by_delta": get_by_delta,
+            "get_atm": get_atm,
+            "get_contract": get_contract,
+            "get_contract_series": get_contract_series,
+        }
+
+        # ── 5. Execute strategy code ──
+        t_exec = time.perf_counter()
+        exec(strategy_code, sandbox, sandbox)
+        timings_ms["strategy_exec"] = int((time.perf_counter() - t_exec) * 1000)
+
+        pf = sandbox.get("pf")
+        if pf is None:
+            return json.dumps(
+                {"error": {"message": "strategy_code did not define `pf`. "
+                           "Create a VectorBT portfolio as `pf = vbt.Portfolio...`"}},
+                separators=(",", ":"),
+            )
+
+        # ── 6. Extract results ──
+        t_stats = time.perf_counter()
+        stats = pf.stats()
+        stats_dict = stats.to_dict() if hasattr(stats, "to_dict") else dict(stats)
+        stats_dict = {str(k): _json_safe_value(v) for k, v in stats_dict.items()}
+        timings_ms["stats"] = int((time.perf_counter() - t_stats) * 1000)
+
+        t_ts = time.perf_counter()
+        equity = pf.value()
+        if isinstance(equity, pd.DataFrame):
+            equity = equity.iloc[:, 0] if equity.shape[1] == 1 else equity.sum(axis=1)
+        equity_points = _series_to_points(equity, "equity")
+
+        cum_returns = equity.pct_change().fillna(0).add(1).cumprod().sub(1)
+        cum_return_points = _series_to_points(cum_returns, "r")
+
+        # Benchmark: buy-and-hold underlying
+        bm_close = underlying_df["Close"]
+        bm_cum = bm_close.pct_change().fillna(0).add(1).cumprod().sub(1)
+        benchmark_points = _series_to_points(bm_cum, "r")
+        timings_ms["timeseries"] = int((time.perf_counter() - t_ts) * 1000)
+
+        timings_ms["total"] = int((time.perf_counter() - t0) * 1000)
+
+        # Chain metadata summary
+        chain_meta = {
+            "records": len(chain),
+            "columns": list(chain.columns),
+        }
+        if "expiration" in chain.columns:
+            chain_meta["expirations"] = sorted(chain["expiration"].dt.strftime("%Y-%m-%d").unique().tolist())
+        if "strike" in chain.columns:
+            chain_meta["strike_range"] = [float(chain["strike"].min()), float(chain["strike"].max())]
+        if "right" in chain.columns:
+            chain_meta["rights"] = sorted(chain["right"].unique().tolist())
+        if "date" in chain.columns:
+            chain_meta["date_range"] = [chain["date"].min().strftime("%Y-%m-%d"),
+                                        chain["date"].max().strftime("%Y-%m-%d")]
+
+        payload = {
+            "symbol": symbol,
+            "bar_count": len(underlying_df),
+            "chain_meta": chain_meta,
+            "timings_ms": {str(k): _json_safe_value(v) for k, v in timings_ms.items()},
+            "stats": stats_dict,
+            "equity_curve": equity_points,
+            "cum_returns": cum_return_points,
+            "benchmark_cum_returns": benchmark_points,
+        }
+        if fetch_errors:
+            payload["fetch_warnings"] = fetch_errors
+        return json.dumps(payload, separators=(",", ":"))
+
+    except Exception as e:
+        return json.dumps(
+            {"error": {"message": str(e), "traceback": traceback.format_exc()}},
+            separators=(",", ":"),
+        )
+
+
+# ============================================================================
 # Order Management Tools
 # ============================================================================
 
