@@ -3296,19 +3296,36 @@ async def execute_options_backtest(
 
         all_chain_rows: list = []
         fetch_errors: list = []
+        greeks_available = True
+        # Try greeks endpoint first; fall back to basic EOD if permission denied
         for r in rights_list:
+            _params = {
+                "symbol": symbol, "expiration": "*", "strike": "*",
+                "right": r, "start_date": start_clean, "end_date": end_clean,
+                "max_dte": str(max_dte), "num_strikes": str(strike_count),
+            }
             try:
-                rows = _theta_get("/v3/option/history/greeks/eod", {
-                    "symbol": symbol, "expiration": "*", "strike": "*",
-                    "right": r, "start_date": start_clean, "end_date": end_clean,
-                    "max_dte": str(max_dte), "num_strikes": str(strike_count),
-                })
+                if greeks_available:
+                    rows = _theta_get("/v3/option/history/greeks/eod", _params)
+                else:
+                    rows = _theta_get("/v3/option/history/eod", _params)
                 all_chain_rows.extend(rows)
             except _requests.exceptions.ConnectionError:
                 return json.dumps({
                     "error": "Cannot connect to Theta Terminal at " + THETADATA_URL +
                              ". Make sure the Theta Terminal v3 is running."
                 }, separators=(",", ":"))
+            except _requests.exceptions.HTTPError as e:
+                # Permission denied → fall back to basic EOD (no Greeks)
+                if e.response is not None and e.response.status_code in (403, 401):
+                    greeks_available = False
+                    try:
+                        rows = _theta_get("/v3/option/history/eod", _params)
+                        all_chain_rows.extend(rows)
+                    except Exception as e2:
+                        fetch_errors.append(f"{r}: {str(e2)}")
+                else:
+                    fetch_errors.append(f"{r}: {str(e)}")
             except Exception as e:
                 fetch_errors.append(f"{r}: {str(e)}")
 
@@ -3349,8 +3366,13 @@ async def execute_options_backtest(
         if "date" in chain.columns and "expiration" in chain.columns:
             chain["dte"] = (chain["expiration"] - chain["date"]).dt.days
 
+        if not greeks_available:
+            fetch_errors.append("Greeks require paid ThetaData subscription; using basic EOD prices only. "
+                                "get_by_delta() will not work.")
+
         timings_ms["chain_fetch"] = int((time.perf_counter() - t_chain_start) * 1000)
         timings_ms["chain_records"] = len(chain)
+        timings_ms["greeks_available"] = greeks_available
 
         # ── 3. Helper functions for the sandbox ──
         def get_chain_on_date(dt, right=None, min_dte=None, max_dte=None):
@@ -3503,6 +3525,7 @@ async def execute_options_backtest(
             "get_atm": get_atm,
             "get_contract": get_contract,
             "get_contract_series": get_contract_series,
+            "greeks_available": greeks_available,
         }
 
         # ── 5. Execute strategy code ──
