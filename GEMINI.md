@@ -374,43 +374,59 @@ Backtest **real options strategies** using ThetaData EOD option prices + Greeks 
 |----------|-------------|
 | `get_chain_on_date(date, right=None, min_dte=None, max_dte=None)` | Option chain snapshot for a specific date |
 | `nearest_expiry(date, min_dte=20, max_dte=45)` | Find nearest expiration with DTE in range → `Timestamp` or `None` |
-| `get_by_delta(date, expiration, target_delta, right='C')` | Find contract closest to target delta → `Series` or `None` |
 | `get_atm(date, expiration, right='C')` | Get ATM contract → `Series` or `None` |
 | `get_contract(date, expiration, strike, right='C')` | Get specific contract row → `Series` or `None` |
 | `get_contract_series(expiration, strike, right='C')` | Full time series for one contract → `DataFrame` |
 
 ### Strategy Examples
 
-#### 1. Sell 30-delta put, roll at 21 DTE
+#### 1. Sell OTM put (~5% below ATM), roll at 21 DTE
 
 ```
 symbol: "SPY"
 start: "2025-06-01"
 end: "2026-02-01"
+right: "put"
 strategy_code: |
   dates = sorted(chain['date'].unique())
-  pnl = pd.Series(0.0, index=range(len(dates)))
+  returns = pd.Series(0.0, index=dates)
   position = None
 
   for i, dt in enumerate(dates):
       if position is not None:
           cur = get_contract(dt, position['exp'], position['strike'], 'P')
           if cur is not None:
-              pnl.iloc[i] = position['entry'] - cur['close']  # short put P&L
-              if cur['dte'] <= 21 or (position['entry'] - cur['close']) > position['entry'] * 0.5:
-                  position = None  # close and re-open below
+              daily_pnl = position['last_price'] - cur['close']
+              returns.loc[dt] = daily_pnl / 10000.0
+              position['last_price'] = cur['close']
+              if cur['dte'] <= 21 or cur['close'] > position['entry'] * 1.5:
+                  position = None
+          else:
+              position = None
 
       if position is None:
           exp = nearest_expiry(dt, min_dte=30, max_dte=50)
           if exp is not None:
-              contract = get_by_delta(dt, exp, -0.30, 'P')
-              if contract is not None:
-                  position = {'exp': exp, 'strike': contract['strike'], 'entry': contract['close']}
+              atm = get_atm(dt, exp, 'P')
+              if atm is not None:
+                  # Pick strike ~5% below ATM (≈ 30 delta equivalent)
+                  target_strike = round(atm['strike'] * 0.95)
+                  contract = get_contract(dt, exp, target_strike, 'P')
+                  if contract is None:
+                      # Find nearest available strike
+                      snap = get_chain_on_date(dt, right='P')
+                      snap = snap[snap['expiration'] == exp]
+                      if not snap.empty:
+                          idx = (snap['strike'] - target_strike).abs().idxmin()
+                          contract = snap.loc[idx]
+                  if contract is not None:
+                      position = {'exp': exp, 'strike': contract['strike'],
+                                  'entry': contract['close'], 'last_price': contract['close']}
 
-  pf = vbt.Portfolio.from_returns(pnl / 10000, init_cash=10000, freq='1D')
+  pf = vbt.Portfolio.from_returns(returns, init_cash=10000, freq='1D')
 ```
 
-#### 2. Buy ATM straddle on high IV days
+#### 2. Buy ATM straddle, hold 1 day
 
 ```
 symbol: "AAPL"
@@ -429,12 +445,6 @@ strategy_code: |
       call = get_atm(dt, exp, 'C')
       put = get_atm(dt, exp, 'P')
       if call is None or put is None:
-          returns.append(0.0)
-          continue
-
-      # Only enter if IV > 30%
-      avg_iv = (call['iv'] + put['iv']) / 2
-      if avg_iv < 0.30:
           returns.append(0.0)
           continue
 
@@ -478,13 +488,29 @@ strategy_code: |
       if position is None:
           exp = nearest_expiry(dt, min_dte=25, max_dte=40)
           if exp:
-              contract = get_by_delta(dt, exp, 0.20, 'C')
-              if contract is not None:
-                  position = {'exp': exp, 'strike': contract['strike'], 'entry': contract['close']}
+              atm = get_atm(dt, exp, 'C')
+              if atm is not None:
+                  # Pick strike ~3% above ATM
+                  target_strike = round(atm['strike'] * 1.03)
+                  contract = get_contract(dt, exp, target_strike, 'C')
+                  if contract is None:
+                      snap = get_chain_on_date(dt, right='C')
+                      snap = snap[snap['expiration'] == exp]
+                      if not snap.empty:
+                          idx = (snap['strike'] - target_strike).abs().idxmin()
+                          contract = snap.loc[idx]
+                  if contract is not None:
+                      position = {'exp': exp, 'strike': contract['strike'], 'entry': contract['close']}
 
   total_ret = underlying_ret + call_pnl / (close.shift(1).fillna(close.iloc[0]))
   pf = vbt.Portfolio.from_returns(total_ret.dropna(), init_cash=10000, freq='1D')
 ```
+
+### Free tier vs paid tier
+
+- **Free tier** — EOD prices (OHLCV, bid/ask, volume). All helpers except delta-based selection work.
+- **Standard tier ($30/mo)** — adds Greeks (delta, gamma, theta, vega, rho, IV). If you upgrade, the tool auto-detects and includes Greeks columns in `chain`.
+- **No delta column on free tier** — select contracts by strike price relative to ATM instead (e.g., `atm['strike'] * 0.95` for ~5% OTM put).
 
 ### Common mistakes (options backtest)
 
@@ -494,3 +520,4 @@ strategy_code: |
 4. **`chain` dates are `pd.Timestamp`** — compare with `pd.Timestamp('2025-06-01')`, not strings.
 5. **`right` in chain is `'C'` or `'P'`** — uppercase single character.
 6. **No import statements needed** — everything is pre-loaded.
+7. **Strike may not match exactly** — use `get_chain_on_date` + find nearest strike when a computed strike doesn't exist.

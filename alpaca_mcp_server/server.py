@@ -3176,7 +3176,6 @@ async def execute_options_backtest(
     Helper functions:
       get_chain_on_date(date, right=None, min_dte=None, max_dte=None)
       nearest_expiry(date, min_dte=20, max_dte=45)
-      get_by_delta(date, expiration, target_delta, right='C')
       get_atm(date, expiration, right='C')
       get_contract(date, expiration, strike, right='C')
       get_contract_series(expiration, strike, right='C')
@@ -3371,10 +3370,6 @@ async def execute_options_backtest(
         if "date" in chain.columns and "expiration" in chain.columns:
             chain["dte"] = (chain["expiration"] - chain["date"]).dt.days
 
-        if not greeks_available:
-            fetch_errors.append("Greeks require paid ThetaData subscription; using basic EOD prices only. "
-                                "get_by_delta() will not work.")
-
         timings_ms["chain_fetch"] = int((time.perf_counter() - t_chain_start) * 1000)
         timings_ms["chain_records"] = len(chain)
         timings_ms["greeks_available"] = greeks_available
@@ -3399,18 +3394,6 @@ async def execute_options_backtest(
             if snap.empty:
                 return None
             return snap.sort_values("dte")["expiration"].iloc[0]
-
-        def get_by_delta(dt, expiration, target_delta, right="C"):
-            """Find contract closest to target delta. Returns Series or None."""
-            snap = get_chain_on_date(dt)
-            if isinstance(expiration, str):
-                expiration = pd.Timestamp(expiration)
-            mask = (snap["expiration"] == expiration) & (snap["right"] == right.upper())
-            cands = snap[mask]
-            if cands.empty or "delta" not in cands.columns:
-                return None
-            idx = (cands["delta"] - target_delta).abs().idxmin()
-            return cands.loc[idx]
 
         def get_atm(dt, expiration, right="C"):
             """Get ATM contract for date and expiration. Returns Series or None."""
@@ -3526,7 +3509,6 @@ async def execute_options_backtest(
             # Helper functions
             "get_chain_on_date": get_chain_on_date,
             "nearest_expiry": nearest_expiry,
-            "get_by_delta": get_by_delta,
             "get_atm": get_atm,
             "get_contract": get_contract,
             "get_contract_series": get_contract_series,
