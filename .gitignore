@@ -21,6 +21,9 @@ thetadata/ThetaTerminalv3.jar
 thetadata/lib/
 thetadata/config.toml
 
+# Cached options data (large parquet files)
+data/options_cache/
+
 # OS
 .DS_Store
 Thumbs.db

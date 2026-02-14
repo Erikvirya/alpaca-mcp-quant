@@ -3289,7 +3289,7 @@ async def execute_options_backtest(
         underlying_df = underlying_df.set_index("timestamp").sort_index()
         timings_ms["underlying_fetch"] = int((time.perf_counter() - t_underlying) * 1000)
 
-        # ── 2. Fetch option chain + Greeks from ThetaData ──
+        # ── 2. Fetch option chain from local cache or ThetaData ──
         t_chain_start = time.perf_counter()
         if right.lower() == "both":
             rights_list = ["C", "P"]
@@ -3301,37 +3301,65 @@ async def execute_options_backtest(
         all_chain_rows: list = []
         fetch_errors: list = []
         greeks_available = True
-        # Try greeks endpoint first; fall back to basic EOD if permission denied
-        for r in rights_list:
-            _params = {
-                "symbol": symbol, "expiration": "*", "strike": "*",
-                "right": r, "start_date": start_clean, "end_date": end_clean,
-                "max_dte": str(max_dte), "num_strikes": str(strike_count),
-            }
+        cache_used = False
+
+        # Check for local parquet cache first
+        _cache_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                  "data", "options_cache")
+        _cache_path = os.path.join(_cache_dir, f"{symbol}_eod.parquet")
+        if os.path.exists(_cache_path):
             try:
-                if greeks_available:
-                    rows = _theta_get("/v3/option/history/greeks/eod", _params)
-                else:
-                    rows = _theta_get("/v3/option/history/eod", _params)
-                all_chain_rows.extend(rows)
-            except _requests.exceptions.ConnectionError:
-                return json.dumps({
-                    "error": "Cannot connect to Theta Terminal at " + THETADATA_URL +
-                             ". Make sure the Theta Terminal v3 is running."
-                }, separators=(",", ":"))
-            except _requests.exceptions.HTTPError as e:
-                # Permission denied → fall back to basic EOD (no Greeks)
-                if e.response is not None and e.response.status_code in (403, 401):
-                    greeks_available = False
-                    try:
-                        rows = _theta_get("/v3/option/history/eod", _params)
-                        all_chain_rows.extend(rows)
-                    except Exception as e2:
-                        fetch_errors.append(f"{r}: {str(e2)}")
-                else:
-                    fetch_errors.append(f"{r}: {str(e)}")
+                _cached = pd.read_parquet(_cache_path)
+                # Filter by date range
+                if "date" in _cached.columns:
+                    _s = int(start_clean)
+                    _e = int(end_clean)
+                    _cached = _cached[(_cached["date"] >= _s) & (_cached["date"] <= _e)]
+                # Filter by right
+                if "right" in _cached.columns:
+                    _cached = _cached[_cached["right"].isin(rights_list)]
+                # Filter by max_dte if dte column exists
+                if "dte" in _cached.columns:
+                    _cached = _cached[_cached["dte"] <= max_dte]
+                if not _cached.empty:
+                    all_chain_rows = _cached.to_dict("records")
+                    cache_used = True
+                    greeks_available = "delta" in _cached.columns
             except Exception as e:
-                fetch_errors.append(f"{r}: {str(e)}")
+                fetch_errors.append(f"cache read error: {str(e)}")
+
+        # Fall back to ThetaData API if no cache hit
+        if not all_chain_rows:
+            for r in rights_list:
+                _params = {
+                    "symbol": symbol, "expiration": "*", "strike": "*",
+                    "right": r, "start_date": start_clean, "end_date": end_clean,
+                    "max_dte": str(max_dte), "num_strikes": str(strike_count),
+                }
+                try:
+                    if greeks_available:
+                        rows = _theta_get("/v3/option/history/greeks/eod", _params)
+                    else:
+                        rows = _theta_get("/v3/option/history/eod", _params)
+                    all_chain_rows.extend(rows)
+                except _requests.exceptions.ConnectionError:
+                    return json.dumps({
+                        "error": "Cannot connect to Theta Terminal at " + THETADATA_URL +
+                                 ". Make sure the Theta Terminal v3 is running, "
+                                 "or download data locally first with download_options_data.py"
+                    }, separators=(",", ":"))
+                except _requests.exceptions.HTTPError as e:
+                    if e.response is not None and e.response.status_code in (403, 401):
+                        greeks_available = False
+                        try:
+                            rows = _theta_get("/v3/option/history/eod", _params)
+                            all_chain_rows.extend(rows)
+                        except Exception as e2:
+                            fetch_errors.append(f"{r}: {str(e2)}")
+                    else:
+                        fetch_errors.append(f"{r}: {str(e)}")
+                except Exception as e:
+                    fetch_errors.append(f"{r}: {str(e)}")
 
         if not all_chain_rows:
             msg = f"No option chain data returned from ThetaData for {symbol}"
@@ -3373,6 +3401,7 @@ async def execute_options_backtest(
         timings_ms["chain_fetch"] = int((time.perf_counter() - t_chain_start) * 1000)
         timings_ms["chain_records"] = len(chain)
         timings_ms["greeks_available"] = greeks_available
+        timings_ms["cache_used"] = cache_used
 
         # ── 3. Helper functions for the sandbox ──
         def get_chain_on_date(dt, right=None, min_dte=None, max_dte=None):
