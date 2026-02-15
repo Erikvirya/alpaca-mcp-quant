@@ -507,7 +507,15 @@ book = OptionsBook(init_cash=100000)  # optional: contract_size=100
 | `nearest_expiry(date, min_dte=20, max_dte=45)` | Find nearest expiration with DTE in range → `Timestamp` or `None` |
 | `get_atm(date, expiration, right='C')` | Get ATM contract → `Series` or `None` |
 | `get_contract(date, expiration, strike, right='C')` | Get specific contract row → `Series` or `None` |
-| `get_contract_series(expiration, strike, right='C')` | Full time series for one contract → `DataFrame` |
+| `get_contract_series(expiration, strike, right='C', as_of=None)` | Time series for one contract → `DataFrame`. **Pass `as_of=dt` to avoid look-ahead bias.** |
+
+### Look-ahead bias protection
+
+- **`vbt.Portfolio.from_signals`** — signals are auto-lagged by 1 bar (same as equity backtester). Trades execute on the next bar.
+- **`get_contract(dt, ...)` / `get_atm(dt, ...)` / `get_chain_on_date(dt)`** — only return data for the requested date. No look-ahead.
+- **`OptionsBook`** — all methods (`open`, `close`, `update`) use `get_contract(dt)` internally. Buys fill at ask, sells at bid. No look-ahead.
+- **`get_contract_series()`** — pass `as_of=dt` to only see data up to that date. Without it, returns full history (future included).
+- **`chain` and `df`** — raw DataFrames contain all dates. In manual loops, only use `chain[chain['date'] == dt]` or helpers to avoid peeking ahead.
 
 ### Strategy Examples
 

@@ -4126,13 +4126,19 @@ async def execute_options_backtest(
             result = snap[mask]
             return result.iloc[0] if not result.empty else None
 
-        def get_contract_series(expiration, strike, right="C"):
-            """Full time series for a specific contract. Returns DataFrame."""
+        def get_contract_series(expiration, strike, right="C", as_of=None):
+            """Time series for a specific contract up to as_of date (inclusive).
+            If as_of is None, returns full history (⚠️ includes future data).
+            Always pass as_of=current_date in a backtest loop to avoid look-ahead bias."""
             if isinstance(expiration, str):
                 expiration = pd.Timestamp(expiration)
             mask = ((chain["expiration"] == expiration) &
                     (chain["strike"] == strike) &
                     (chain["right"] == right.upper()))
+            if as_of is not None:
+                if isinstance(as_of, str):
+                    as_of = pd.Timestamp(as_of)
+                mask &= chain["date"] <= as_of
             result = chain[mask].copy()
             if "date" in result.columns:
                 result = result.set_index("date").sort_index()
@@ -4147,10 +4153,30 @@ async def execute_options_backtest(
             if "direction" in kw and isinstance(kw["direction"], str):
                 kw["direction"] = _dir_map.get(kw["direction"].lower().strip(), kw["direction"])
 
+        def _opt_lag_one(x):
+            """Shift boolean signals by 1 bar to prevent look-ahead bias."""
+            if x is None:
+                return None
+            if isinstance(x, pd.Series):
+                return x.shift(1).fillna(False)
+            if isinstance(x, pd.DataFrame):
+                return x.shift(1).fillna(False)
+            if np is not None and isinstance(x, np.ndarray):
+                if x.size == 0:
+                    return x
+                return np.concatenate(([False], x[:-1].astype(bool)))
+            return x
+
         class _OptPfProxy:
             @staticmethod
             def from_signals(close, entries, exits=None, *a, **kw):
                 _norm_dir(kw)
+                entries = _opt_lag_one(entries)
+                exits = _opt_lag_one(exits)
+                if "short_entries" in kw:
+                    kw["short_entries"] = _opt_lag_one(kw["short_entries"])
+                if "short_exits" in kw:
+                    kw["short_exits"] = _opt_lag_one(kw["short_exits"])
                 return _real_portfolio.from_signals(close, entries, exits, *a, **kw)
 
             @staticmethod
