@@ -88,6 +88,88 @@ def _yf_download(ticker, start=None, end=None, period="1y"):
     return h
 
 
+DOLTHUB_API_BASE = "https://www.dolthub.com/api/v1alpha1/post-no-preference/options/master"
+
+
+def _dolthub_query(sql: str, timeout: int = 60) -> List[Dict[str, Any]]:
+    """Execute a SQL query against the DoltHub post-no-preference/options database.
+    Returns list of row dicts, or raises on error."""
+    r = _requests.get(DOLTHUB_API_BASE, params={"q": sql}, timeout=timeout)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("query_execution_status") != "Success":
+        raise RuntimeError(data.get("query_execution_message", "DoltHub query failed"))
+    return data.get("rows", [])
+
+
+def _dolthub_fetch_chain(symbol: str, start_date: str, end_date: str,
+                         rights: List[str], max_dte: int = 60) -> List[Dict[str, Any]]:
+    """Fetch option chain rows from DoltHub for a symbol and date range.
+    Returns list of row dicts normalized for the backtester.
+    Dates should be YYYY-MM-DD strings. Rights should be ['C'], ['P'], or ['C','P']."""
+    right_map = {"C": "Call", "P": "Put"}
+    right_filter = ", ".join(f"'{right_map.get(r, r)}'" for r in rights)
+
+    sql = (
+        f"SELECT date, act_symbol, expiration, strike, call_put, "
+        f"bid, ask, vol, delta, gamma, theta, vega, rho "
+        f"FROM option_chain "
+        f"WHERE act_symbol = '{symbol}' "
+        f"AND date >= '{start_date}' AND date <= '{end_date}' "
+        f"AND call_put IN ({right_filter}) "
+        f"ORDER BY date, expiration, strike"
+    )
+
+    rows = _dolthub_query(sql, timeout=120)
+
+    # Normalize to match backtester column format
+    normalized = []
+    for row in rows:
+        # Convert date strings to YYYYMMDD int
+        d_str = row.get("date", "")
+        exp_str = row.get("expiration", "")
+        d_int = int(d_str.replace("-", "")) if d_str else 0
+        exp_int = int(exp_str.replace("-", "")) if exp_str else 0
+
+        # Compute DTE
+        try:
+            from datetime import datetime as _dt
+            d_date = _dt.strptime(d_str, "%Y-%m-%d")
+            exp_date = _dt.strptime(exp_str, "%Y-%m-%d")
+            dte = (exp_date - d_date).days
+        except Exception:
+            dte = 0
+
+        if dte > max_dte:
+            continue
+
+        cp = row.get("call_put", "")
+        right_char = "C" if cp.lower().startswith("c") else "P"
+
+        rec = {
+            "date": d_int,
+            "expiration": exp_int,
+            "strike": float(row.get("strike", 0)),
+            "right": right_char,
+            "bid": float(row.get("bid", 0)) if row.get("bid") is not None else 0.0,
+            "ask": float(row.get("ask", 0)) if row.get("ask") is not None else 0.0,
+            "close": round((float(row.get("bid", 0) or 0) + float(row.get("ask", 0) or 0)) / 2, 4),
+            "open": round((float(row.get("bid", 0) or 0) + float(row.get("ask", 0) or 0)) / 2, 4),
+            "high": float(row.get("ask", 0)) if row.get("ask") is not None else 0.0,
+            "low": float(row.get("bid", 0)) if row.get("bid") is not None else 0.0,
+            "volume": 0,
+            "iv": float(row.get("vol", 0)) if row.get("vol") is not None else None,
+            "delta": float(row.get("delta", 0)) if row.get("delta") is not None else None,
+            "gamma": float(row.get("gamma", 0)) if row.get("gamma") is not None else None,
+            "theta": float(row.get("theta", 0)) if row.get("theta") is not None else None,
+            "vega": float(row.get("vega", 0)) if row.get("vega") is not None else None,
+            "rho": float(row.get("rho", 0)) if row.get("rho") is not None else None,
+        }
+        normalized.append(rec)
+
+    return normalized
+
+
 _BARS_DF_CACHE: Dict[str, Any] = {}
 _BARS_DF_CACHE_TTL_SECONDS = 300
 
@@ -2671,6 +2753,150 @@ async def get_yahoo_finance_data(
 
 
 # ============================================================================
+# DoltHub Options Data Tools (free historical Greeks)
+# ============================================================================
+
+@mcp.tool()
+async def get_dolthub_options(
+    symbol: str,
+    start: str,
+    end: str = "",
+    right: str = "both",
+    max_dte: int = 60,
+) -> str:
+    """
+    Fetch historical options data WITH GREEKS from the free DoltHub database
+    (post-no-preference/options). Covers S&P 500 components + SPY + SPDR ETFs,
+    from 2019 to present, updated daily.
+
+    Unlike ThetaData free tier, this includes delta, gamma, theta, vega, rho, and IV.
+    Limitation: only ~3 short-term expirations per date (~2wk, ~4wk, ~8wk).
+
+    Args:
+        symbol (str): Underlying symbol (e.g. 'SPY', 'AAPL', 'MSFT')
+        start (str): Start date 'YYYY-MM-DD'
+        end (str): End date 'YYYY-MM-DD' (default: yesterday)
+        right (str): 'call', 'put', or 'both' (default: 'both')
+        max_dte (int): Max days-to-expiration to include (default: 60)
+
+    Returns:
+        str: JSON with option chain data including Greeks
+    """
+    if pd is None:
+        return json.dumps({"error": "pandas is required"}, separators=(",", ":"))
+
+    try:
+        symbol = symbol.upper().strip()
+        if not start:
+            return json.dumps({"error": "start date is required"}, separators=(",", ":"))
+
+        start_clean = start.strip()
+        if len(start_clean) == 8 and start_clean.isdigit():
+            start_clean = f"{start_clean[:4]}-{start_clean[4:6]}-{start_clean[6:]}"
+
+        if end:
+            end_clean = end.strip()
+            if len(end_clean) == 8 and end_clean.isdigit():
+                end_clean = f"{end_clean[:4]}-{end_clean[4:6]}-{end_clean[6:]}"
+        else:
+            end_clean = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+
+        if right.lower() == "both":
+            rights_list = ["C", "P"]
+        elif right.lower().startswith("c"):
+            rights_list = ["C"]
+        else:
+            rights_list = ["P"]
+
+        rows = _dolthub_fetch_chain(symbol, start_clean, end_clean, rights_list, max_dte)
+
+        if not rows:
+            return json.dumps({"error": f"No DoltHub data for {symbol} from {start_clean} to {end_clean}. "
+                               "DoltHub covers S&P 500 components + SPY + SPDR ETFs only."}, separators=(",", ":"))
+
+        # Build summary
+        df = pd.DataFrame(rows)
+        dates = sorted(df["date"].unique())
+        expirations = sorted(df["expiration"].unique())
+
+        meta = {
+            "symbol": symbol,
+            "source": "dolthub",
+            "start": start_clean,
+            "end": end_clean,
+            "rows": len(rows),
+            "trading_days": len(dates),
+            "expirations": len(expirations),
+            "greeks_available": True,
+            "rights": rights_list,
+        }
+
+        # Limit output to 500 rows
+        output_rows = rows[:500] if len(rows) > 500 else rows
+
+        return json.dumps({
+            "meta": meta,
+            "data": output_rows,
+        }, separators=(",", ":"))
+
+    except Exception as e:
+        return json.dumps({"error": f"DoltHub query error: {str(e)}"}, separators=(",", ":"))
+
+
+@mcp.tool()
+async def get_dolthub_volatility_history(
+    symbol: str,
+    start: str = "",
+    end: str = "",
+    limit: int = 252,
+) -> str:
+    """
+    Fetch historical and implied volatility history from DoltHub for a symbol.
+    Returns daily HV/IV snapshots with current, week-ago, month-ago, and year high/low.
+
+    Covers S&P 500 components + SPY + SPDR ETFs, from 2019 to present.
+
+    Args:
+        symbol (str): Symbol (e.g. 'SPY', 'AAPL')
+        start (str): Start date 'YYYY-MM-DD' (optional)
+        end (str): End date 'YYYY-MM-DD' (optional)
+        limit (int): Max rows to return (default: 252, ~1 year)
+
+    Returns:
+        str: JSON with volatility history data
+    """
+    try:
+        symbol = symbol.upper().strip()
+
+        where = f"act_symbol = '{symbol}'"
+        if start:
+            s = start.strip()
+            if len(s) == 8 and s.isdigit():
+                s = f"{s[:4]}-{s[4:6]}-{s[6:]}"
+            where += f" AND date >= '{s}'"
+        if end:
+            e = end.strip()
+            if len(e) == 8 and e.isdigit():
+                e = f"{e[:4]}-{e[4:6]}-{e[6:]}"
+            where += f" AND date <= '{e}'"
+
+        sql = f"SELECT * FROM volatility_history WHERE {where} ORDER BY date DESC LIMIT {limit}"
+        rows = _dolthub_query(sql)
+
+        if not rows:
+            return json.dumps({"error": f"No volatility data for {symbol}. "
+                               "DoltHub covers S&P 500 components + SPY + SPDR ETFs."}, separators=(",", ":"))
+
+        return json.dumps({
+            "meta": {"symbol": symbol, "source": "dolthub", "rows": len(rows)},
+            "data": rows,
+        }, separators=(",", ":"))
+
+    except Exception as e:
+        return json.dumps({"error": f"DoltHub query error: {str(e)}"}, separators=(",", ":"))
+
+
+# ============================================================================
 # Options Market Data Tools
 # ============================================================================
 
@@ -3462,7 +3688,21 @@ async def execute_options_backtest(
             except Exception as e:
                 fetch_errors.append(f"cache read error: {str(e)}")
 
-        # Fall back to ThetaData API if no cache hit
+        # Fall back to DoltHub (free Greeks) if no cache hit
+        dolthub_used = False
+        if not all_chain_rows:
+            try:
+                _start_dash = f"{start_clean[:4]}-{start_clean[4:6]}-{start_clean[6:]}"
+                _end_dash = f"{end_clean[:4]}-{end_clean[4:6]}-{end_clean[6:]}"
+                dh_rows = _dolthub_fetch_chain(symbol, _start_dash, _end_dash, rights_list, max_dte)
+                if dh_rows:
+                    all_chain_rows = dh_rows
+                    dolthub_used = True
+                    greeks_available = True
+            except Exception as e:
+                fetch_errors.append(f"dolthub: {str(e)}")
+
+        # Fall back to ThetaData API if no cache or DoltHub hit
         if not all_chain_rows:
             for r in rights_list:
                 _params = {
@@ -3496,7 +3736,7 @@ async def execute_options_backtest(
                     fetch_errors.append(f"{r}: {str(e)}")
 
         if not all_chain_rows:
-            msg = f"No option chain data returned from ThetaData for {symbol}"
+            msg = f"No option chain data for {symbol} from any source (cache, DoltHub, ThetaData)"
             if fetch_errors:
                 msg += f". Errors: {'; '.join(fetch_errors)}"
             return json.dumps({"error": {"message": msg}}, separators=(",", ":"))
@@ -3536,6 +3776,7 @@ async def execute_options_backtest(
         timings_ms["chain_records"] = len(chain)
         timings_ms["greeks_available"] = greeks_available
         timings_ms["cache_used"] = cache_used
+        timings_ms["dolthub_used"] = dolthub_used
 
         # ── 3. Helper functions for the sandbox ──
         def get_chain_on_date(dt, right=None, min_dte=None, max_dte=None):

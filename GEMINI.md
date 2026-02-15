@@ -315,6 +315,51 @@ Returns JSON with `meta` (symbol, name, rows), `stats` (last, high, low, mean, t
 
 ---
 
+## DoltHub Options Data (free historical Greeks)
+
+Two tools query the free [post-no-preference/options](https://www.dolthub.com/repositories/post-no-preference/options) DoltHub database. It covers **S&P 500 components + SPY + SPDR ETFs** from **2019 to present**, updated daily, with **full Greeks** (delta, gamma, theta, vega, rho, IV).
+
+### `get_dolthub_options`
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `symbol` | `str` | required | Underlying (e.g., `"SPY"`, `"AAPL"`) |
+| `start` | `str` | required | Start date `YYYY-MM-DD` |
+| `end` | `str` | `""` (yesterday) | End date `YYYY-MM-DD` |
+| `right` | `str` | `"both"` | `"call"`, `"put"`, or `"both"` |
+| `max_dte` | `int` | `60` | Max days-to-expiration |
+
+Returns option chain with: `date`, `expiration`, `strike`, `right`, `bid`, `ask`, `close` (mid), `iv`, `delta`, `gamma`, `theta`, `vega`, `rho`.
+
+### `get_dolthub_volatility_history`
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `symbol` | `str` | required | Symbol (e.g., `"SPY"`) |
+| `start` | `str` | `""` | Start date |
+| `end` | `str` | `""` | End date |
+| `limit` | `int` | `252` | Max rows |
+
+Returns daily IV/HV snapshots: `hv_current`, `hv_week_ago`, `iv_current`, `iv_week_ago`, `iv_year_high`, `iv_year_low`, etc.
+
+### Limitations
+
+- **Only ~3 short-term expirations** per date (~2wk, ~4wk, ~8wk) — no LEAPs or monthlies beyond 8 weeks
+- **S&P 500 components only** — no small caps or non-US
+- **No OHLCV** — only bid/ask (close is computed as mid-price)
+- Large date ranges may timeout on the DoltHub API
+
+### Backtester integration
+
+`execute_options_backtest` automatically tries DoltHub as a fallback between local cache and ThetaData. Data source priority:
+1. **Local parquet cache** (`data/options_cache/`)
+2. **DoltHub** (free Greeks, S&P 500 only)
+3. **ThetaData API** (all symbols, needs Theta Terminal running)
+
+The `timings` output includes `dolthub_used: true/false` to show which source was used.
+
+---
+
 ## ThetaData Options Tools (FREE historical EOD)
 
 These tools require the **Theta Terminal v3** running locally. It's a Java app that hosts a REST API on `http://127.0.0.1:25503`.
