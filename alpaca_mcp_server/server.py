@@ -67,6 +67,27 @@ try:
 except Exception:
     yf = None
 
+
+def _yf_download(ticker, start=None, end=None, period="1y"):
+    """Download Yahoo Finance data as a DataFrame with tz-naive DatetimeIndex.
+    Available in both equity and options backtest sandboxes.
+    Examples: yf_download('^VIX'), yf_download('^TNX', start='2024-01-01')"""
+    if yf is None:
+        raise RuntimeError("yfinance not installed. Run: pip install yfinance")
+    kw = {}
+    if start:
+        kw["start"] = start
+        if end:
+            kw["end"] = end
+    else:
+        kw["period"] = period
+    t = yf.Ticker(ticker)
+    h = t.history(**kw)
+    if h is not None and not h.empty and h.index.tz is not None:
+        h.index = h.index.tz_localize(None)
+    return h
+
+
 _BARS_DF_CACHE: Dict[str, Any] = {}
 _BARS_DF_CACHE_TTL_SECONDS = 300
 
@@ -1450,6 +1471,7 @@ async def execute_vectorbt_strategy(
             "scipy_stats": scipy_stats,
             "itertools": itertools,
             "math": math,
+            "yf_download": _yf_download,
         }
 
         t_exec_start = time.perf_counter()
@@ -3654,6 +3676,7 @@ async def execute_options_backtest(
             "get_contract": get_contract,
             "get_contract_series": get_contract_series,
             "greeks_available": greeks_available,
+            "yf_download": _yf_download,
         }
 
         # ── 5. Execute strategy code ──

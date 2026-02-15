@@ -62,6 +62,7 @@ Your `strategy_code` runs in a restricted sandbox. **Do NOT use import statement
 | `scipy_stats` | scipy.stats | Statistical distributions, t-tests, z-scores, etc. |
 | `itertools` | itertools | Combinations, permutations, etc. Use `itertools.combinations(symbols, 2)` for pairs. |
 | `math` | math | Standard math functions (sqrt, log, ceil, floor, etc.). |
+| `yf_download` | function | Fetch Yahoo Finance data: `yf_download('^VIX')`, `yf_download('^TNX', start='2024-01-01')`. Returns DataFrame with tz-naive DatetimeIndex. |
 
 #### Available builtins
 
@@ -400,6 +401,7 @@ Backtest **real options strategies** using ThetaData EOD option prices + Greeks 
 | `vbt` | vectorbt | VectorBT library (with Portfolio proxy) |
 | `pd`, `np` | libraries | pandas, numpy |
 | `sm`, `statsmodels`, `scipy`, `scipy_stats`, `math`, `itertools` | libraries | Same as equity sandbox |
+| `yf_download` | function | Fetch Yahoo Finance data inline: `yf_download('^VIX', start='2025-01-01')` → DataFrame |
 
 ### `chain` DataFrame columns
 
