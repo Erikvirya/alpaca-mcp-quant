@@ -3286,7 +3286,8 @@ async def execute_options_backtest(
                     "Low": b.low, "Close": b.close, "Volume": b.volume} for b in bar_list]
         underlying_df = pd.DataFrame(rows_u)
         underlying_df["timestamp"] = pd.to_datetime(underlying_df["timestamp"], utc=True)
-        underlying_df = underlying_df.set_index("timestamp").sort_index()
+        underlying_df.index = underlying_df["timestamp"].dt.tz_localize(None).dt.normalize()
+        underlying_df = underlying_df.drop(columns=["timestamp"]).sort_index()
         timings_ms["underlying_fetch"] = int((time.perf_counter() - t_underlying) * 1000)
 
         # ── 2. Fetch option chain from local cache or ThetaData ──
