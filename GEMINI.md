@@ -447,6 +447,49 @@ Backtest **real options strategies** using ThetaData EOD option prices + Greeks 
 | `pd`, `np` | libraries | pandas, numpy |
 | `sm`, `statsmodels`, `scipy`, `scipy_stats`, `math`, `itertools` | libraries | Same as equity sandbox |
 | `yf_download` | function | Fetch Yahoo Finance data inline: `yf_download('^VIX', start='2025-01-01')` → DataFrame |
+| `OptionsBook` | factory | Position tracker: `book = OptionsBook(init_cash=100000)` — see below |
+
+### `OptionsBook` — Portfolio Position Tracker
+
+Instead of manually tracking positions with dicts and flat return series, use `OptionsBook` for proper multi-position tracking with cash accounting, mark-to-market, and portfolio Greeks.
+
+```python
+book = OptionsBook(init_cash=100000)  # optional: contract_size=100
+```
+
+#### Methods
+
+| Method | Description |
+|--------|-------------|
+| `book.update(dt)` | **Call every date** — marks all positions to market, records equity snapshot |
+| `book.open(dt, exp, strike, right, qty=1, price=None)` | Open position. `qty>0` = buy, `qty<0` = sell. Returns position dict or None |
+| `book.close(pos, dt, price=None)` | Close a position. Returns realized P&L ($) |
+| `book.close_all(dt)` | Close all open positions |
+| `book.close_expired(dt)` | Close positions where expiration ≤ dt (at price=0) |
+| `book.find(expiration=, strike=, right=)` | Find open positions matching criteria |
+| `book.to_portfolio()` | Convert equity curve → `vbt.Portfolio` (assign to `pf`) |
+
+#### Properties
+
+| Property | Description |
+|----------|-------------|
+| `book.cash` | Current cash balance |
+| `book.equity` | Total equity (cash + positions) |
+| `book.open_positions` | List of open position dicts |
+| `book.num_positions` | Number of open positions |
+| `book.greeks` | Aggregate portfolio `{delta, gamma, theta, vega}` |
+| `book.summary` | Stats dict (return %, win rate, avg P&L, etc.) |
+| `book.trade_log` | DataFrame of all closed trades |
+
+#### Position dict keys
+
+`id`, `entry_date`, `expiration`, `strike`, `right`, `qty`, `entry_price`, `mark`, `market_value`, `dte`, `delta`, `gamma`, `theta`, `vega`, `rho`, `iv`
+
+#### Fill logic
+
+- **Opening**: buys fill at ask, sells fill at bid (realistic slippage)
+- **Closing**: longs close at bid, shorts close at ask
+- Override with explicit `price=` parameter
 
 ### `chain` DataFrame columns
 
@@ -592,6 +635,76 @@ strategy_code: |
 
   total_ret = underlying_ret + call_pnl / (close.shift(1).fillna(close.iloc[0]))
   pf = vbt.Portfolio.from_returns(total_ret.dropna(), init_cash=10000, freq='1D')
+```
+
+#### 4. Sell OTM put with OptionsBook (recommended pattern)
+
+```
+symbol: "SPY"
+start: "2025-06-01"
+end: "2026-02-01"
+right: "put"
+strategy_code: |
+  book = OptionsBook(init_cash=100000)
+  dates = sorted(chain['date'].unique())
+
+  for dt in dates:
+      book.update(dt)
+      book.close_expired(dt)
+
+      # Roll at 21 DTE or if loss > 50%
+      for pos in book.open_positions:
+          if pos['dte'] is not None and pos['dte'] <= 21:
+              book.close(pos, dt)
+          elif pos['mark'] > pos['entry_price'] * 1.5:
+              book.close(pos, dt)
+
+      # Open new position if flat
+      if book.num_positions == 0:
+          exp = nearest_expiry(dt, min_dte=30, max_dte=50)
+          if exp:
+              atm = get_atm(dt, exp, 'P')
+              if atm:
+                  target = round(atm['strike'] * 0.95)
+                  book.open(dt, exp, target, 'P', qty=-1)
+
+  pf = book.to_portfolio()
+```
+
+#### 5. Iron condor with OptionsBook
+
+```
+symbol: "SPY"
+start: "2025-06-01"
+end: "2026-02-01"
+right: "both"
+strategy_code: |
+  book = OptionsBook(init_cash=100000)
+  dates = sorted(chain['date'].unique())
+
+  for dt in dates:
+      book.update(dt)
+      book.close_expired(dt)
+
+      # Close all legs at 21 DTE
+      for pos in book.open_positions:
+          if pos['dte'] is not None and pos['dte'] <= 21:
+              book.close(pos, dt)
+
+      if book.num_positions == 0:
+          exp = nearest_expiry(dt, min_dte=30, max_dte=50)
+          if exp:
+              atm = get_atm(dt, exp, 'C')
+              if atm:
+                  s = atm['strike']
+                  # Short strangle wings
+                  book.open(dt, exp, round(s * 1.03), 'C', qty=-1)  # sell OTM call
+                  book.open(dt, exp, round(s * 0.97), 'P', qty=-1)  # sell OTM put
+                  # Long protection wings
+                  book.open(dt, exp, round(s * 1.06), 'C', qty=1)   # buy far OTM call
+                  book.open(dt, exp, round(s * 0.94), 'P', qty=1)   # buy far OTM put
+
+  pf = book.to_portfolio()
 ```
 
 ### Local options data cache

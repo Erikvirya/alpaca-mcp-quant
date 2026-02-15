@@ -88,6 +88,300 @@ def _yf_download(ticker, start=None, end=None, period="1y"):
     return h
 
 
+class _OptionsBook:
+    """Options portfolio position tracker for backtesting.
+
+    Tracks multiple simultaneous positions with proper cash accounting,
+    mark-to-market pricing, P&L attribution, and portfolio-level Greeks.
+    Produces a VBT Portfolio at the end via to_portfolio().
+
+    Usage inside execute_options_backtest sandbox::
+
+        book = OptionsBook(init_cash=100000)
+        for dt in dates:
+            book.update(dt)             # mark-to-market
+            book.close_expired(dt)      # handle expirations
+            for pos in book.open_positions:
+                if pos['dte'] <= 21:
+                    book.close(pos, dt)  # exit at market
+            if book.num_positions == 0:
+                exp = nearest_expiry(dt, 30, 50)
+                if exp:
+                    book.open(dt, exp, strike, 'P', qty=-1)  # sell 1 put
+        pf = book.to_portfolio()
+    """
+
+    def __init__(self, init_cash, get_contract_fn, portfolio_cls, pd_mod, contract_size=100):
+        self._cash = float(init_cash)
+        self._init_cash = float(init_cash)
+        self._get_contract = get_contract_fn
+        self._pf_cls = portfolio_cls
+        self._pd = pd_mod
+        self._cs = int(contract_size)
+        self._open: list = []
+        self._closed: list = []
+        self._equity_snapshots: dict = {}
+        self._next_id = 0
+        self._current_dt = None
+
+    # ── Properties ──
+
+    @property
+    def cash(self):
+        """Current cash balance."""
+        return self._cash
+
+    @property
+    def equity(self):
+        """Total portfolio equity (cash + position market values)."""
+        return self._cash + sum(p['market_value'] for p in self._open)
+
+    @property
+    def open_positions(self):
+        """List of open position dicts."""
+        return list(self._open)
+
+    @property
+    def num_positions(self):
+        """Number of open positions."""
+        return len(self._open)
+
+    @property
+    def greeks(self):
+        """Aggregate portfolio Greeks across all open positions."""
+        agg = {'delta': 0.0, 'gamma': 0.0, 'theta': 0.0, 'vega': 0.0}
+        for p in self._open:
+            sign = 1 if p['qty'] > 0 else -1
+            mult = abs(p['qty']) * self._cs
+            for g in agg:
+                val = p.get(g)
+                if val is not None:
+                    agg[g] += val * mult * sign
+        return agg
+
+    @property
+    def trade_log(self):
+        """DataFrame of all closed trades."""
+        if not self._closed:
+            return self._pd.DataFrame()
+        return self._pd.DataFrame(self._closed)
+
+    @property
+    def summary(self):
+        """Summary statistics dict."""
+        s = {
+            'init_cash': self._init_cash,
+            'final_equity': round(self.equity, 2),
+            'total_return_pct': round((self.equity / self._init_cash - 1) * 100, 2),
+            'cash': round(self._cash, 2),
+            'open_positions': len(self._open),
+            'total_trades': len(self._closed),
+        }
+        if self._closed:
+            tl = self._pd.DataFrame(self._closed)
+            wins = tl[tl['pnl'] > 0]
+            losses = tl[tl['pnl'] < 0]
+            s['winning_trades'] = len(wins)
+            s['losing_trades'] = len(losses)
+            s['win_rate_pct'] = round(len(wins) / len(tl) * 100, 1) if len(tl) > 0 else 0
+            s['total_pnl'] = round(float(tl['pnl'].sum()), 2)
+            s['avg_pnl'] = round(float(tl['pnl'].mean()), 2)
+            s['max_win'] = round(float(tl['pnl'].max()), 2)
+            s['max_loss'] = round(float(tl['pnl'].min()), 2)
+        return s
+
+    # ── Core methods ──
+
+    def update(self, dt):
+        """Mark all open positions to current market prices and record equity snapshot.
+        Call this at the top of every date iteration."""
+        if isinstance(dt, str):
+            dt = self._pd.Timestamp(dt)
+        self._current_dt = dt
+
+        for p in self._open:
+            contract = self._get_contract(dt, p['expiration'], p['strike'], p['right'])
+            if contract is not None:
+                bid = float(contract.get('bid', 0) or 0)
+                ask = float(contract.get('ask', 0) or 0)
+                mid = (bid + ask) / 2 if (bid > 0 and ask > 0) else float(contract.get('close', 0) or 0)
+                if mid > 0:
+                    p['mark'] = mid
+                p['market_value'] = p['qty'] * p['mark'] * self._cs
+                for g in ('delta', 'gamma', 'theta', 'vega', 'rho', 'iv'):
+                    try:
+                        val = contract[g]
+                        p[g] = float(val) if val is not None and not self._pd.isna(val) else None
+                    except (KeyError, TypeError):
+                        pass
+                try:
+                    p['dte'] = int(contract['dte'])
+                except (KeyError, TypeError):
+                    pass
+
+        self._equity_snapshots[dt] = self.equity
+
+    def open(self, dt, expiration, strike, right, qty=1, price=None):
+        """Open a new option position.
+
+        Args:
+            dt: Current date
+            expiration: Option expiration date (str or Timestamp)
+            strike: Strike price
+            right: 'C' or 'P'
+            qty: Number of contracts. Positive = long (buy to open),
+                 negative = short (sell to open)
+            price: Per-share fill price. If None, auto-fills from chain
+                   (ask for buys, bid for sells).
+
+        Returns:
+            Position dict, or None if contract not found.
+        """
+        if isinstance(dt, str):
+            dt = self._pd.Timestamp(dt)
+        if isinstance(expiration, str):
+            expiration = self._pd.Timestamp(expiration)
+        right = right.upper()
+
+        if price is None:
+            contract = self._get_contract(dt, expiration, strike, right)
+            if contract is None:
+                return None
+            bid = float(contract.get('bid', 0) or 0)
+            ask = float(contract.get('ask', 0) or 0)
+            mid = (bid + ask) / 2 if (bid > 0 and ask > 0) else float(contract.get('close', 0) or 0)
+            if qty > 0:
+                price = ask if ask > 0 else mid
+            else:
+                price = bid if bid > 0 else mid
+            if price <= 0:
+                return None
+
+        self._cash -= qty * price * self._cs
+
+        pos = {
+            'id': self._next_id,
+            'entry_date': dt,
+            'expiration': expiration,
+            'strike': float(strike),
+            'right': right,
+            'qty': int(qty),
+            'entry_price': float(price),
+            'mark': float(price),
+            'market_value': qty * price * self._cs,
+            'dte': None,
+            'delta': None, 'gamma': None, 'theta': None, 'vega': None,
+            'rho': None, 'iv': None,
+        }
+        self._next_id += 1
+        self._open.append(pos)
+        return pos
+
+    def close(self, position, dt=None, price=None):
+        """Close an open position.
+
+        Args:
+            position: Position dict from open() or open_positions
+            dt: Close date (default: last update() date)
+            price: Per-share exit price. If None, auto-fills from chain
+                   (bid for closing longs, ask for closing shorts).
+
+        Returns:
+            Realized P&L in dollars (float).
+        """
+        if position not in self._open:
+            return 0.0
+
+        if dt is None:
+            dt = self._current_dt
+        if isinstance(dt, str):
+            dt = self._pd.Timestamp(dt)
+
+        if price is None:
+            contract = self._get_contract(dt, position['expiration'], position['strike'], position['right'])
+            if contract is not None:
+                bid = float(contract.get('bid', 0) or 0)
+                ask = float(contract.get('ask', 0) or 0)
+                mid = (bid + ask) / 2 if (bid > 0 and ask > 0) else float(contract.get('close', 0) or 0)
+                if position['qty'] > 0:
+                    price = bid if bid > 0 else mid
+                else:
+                    price = ask if ask > 0 else mid
+            if price is None or price <= 0:
+                price = position['mark']
+
+        self._cash += position['qty'] * price * self._cs
+
+        pnl = (price - position['entry_price']) * position['qty'] * self._cs
+
+        hold = 0
+        try:
+            hold = (dt - position['entry_date']).days
+        except Exception:
+            pass
+
+        trade = {
+            'id': position['id'],
+            'entry_date': position['entry_date'],
+            'exit_date': dt,
+            'expiration': position['expiration'],
+            'strike': position['strike'],
+            'right': position['right'],
+            'qty': position['qty'],
+            'entry_price': position['entry_price'],
+            'exit_price': float(price),
+            'pnl': round(pnl, 2),
+            'hold_days': hold,
+        }
+        self._closed.append(trade)
+        self._open.remove(position)
+        return pnl
+
+    def close_all(self, dt=None):
+        """Close all open positions at current market prices. Returns total P&L."""
+        total = 0.0
+        for pos in list(self._open):
+            total += self.close(pos, dt)
+        return total
+
+    def close_expired(self, dt=None):
+        """Close positions where expiration <= current date (at price=0). Returns total P&L."""
+        if dt is None:
+            dt = self._current_dt
+        if isinstance(dt, str):
+            dt = self._pd.Timestamp(dt)
+        total = 0.0
+        if dt is not None:
+            for pos in list(self._open):
+                if pos['expiration'] <= dt:
+                    total += self.close(pos, dt, price=0)
+        return total
+
+    def find(self, expiration=None, strike=None, right=None):
+        """Find open positions matching criteria. Returns list of position dicts."""
+        results = []
+        for p in self._open:
+            if expiration is not None:
+                exp = self._pd.Timestamp(expiration) if isinstance(expiration, str) else expiration
+                if p['expiration'] != exp:
+                    continue
+            if strike is not None and p['strike'] != float(strike):
+                continue
+            if right is not None and p['right'] != right.upper():
+                continue
+            results.append(p)
+        return results
+
+    def to_portfolio(self):
+        """Convert equity curve to a VBT Portfolio via from_returns().
+        Call this at the end of your strategy to produce the `pf` object."""
+        if not self._equity_snapshots:
+            raise ValueError("No equity data — call book.update(dt) inside your date loop")
+        eq = self._pd.Series(self._equity_snapshots).sort_index()
+        rets = eq.pct_change().fillna(0)
+        return self._pf_cls.from_returns(rets, init_cash=self._init_cash, freq='1D')
+
+
 DOLTHUB_API_BASE = "https://www.dolthub.com/api/v1alpha1/post-no-preference/options/master"
 
 
@@ -3918,6 +4212,8 @@ async def execute_options_backtest(
             "get_contract_series": get_contract_series,
             "greeks_available": greeks_available,
             "yf_download": _yf_download,
+            "OptionsBook": lambda init_cash=100000, contract_size=100: _OptionsBook(
+                init_cash, get_contract, _real_portfolio, pd, contract_size),
         }
 
         # ── 5. Execute strategy code ──
@@ -3984,6 +4280,25 @@ async def execute_options_backtest(
         }
         if fetch_errors:
             payload["fetch_warnings"] = fetch_errors
+
+        # Include OptionsBook summary/trade_log if strategy used it
+        _book = None
+        for v in sandbox.values():
+            if isinstance(v, _OptionsBook):
+                _book = v
+                break
+        if _book is not None:
+            payload["options_book"] = {
+                "summary": {str(k): _json_safe_value(v) for k, v in _book.summary.items()},
+            }
+            tl = _book.trade_log
+            if not tl.empty:
+                tl_records = []
+                for _, row in tl.iterrows():
+                    tl_records.append({str(k): _json_safe_value(v) for k, v in row.to_dict().items()})
+                payload["options_book"]["trades"] = tl_records[:200]
+                payload["options_book"]["total_trades"] = len(tl)
+
         return json.dumps(payload, separators=(",", ":"))
 
     except Exception as e:
