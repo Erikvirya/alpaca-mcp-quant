@@ -62,6 +62,11 @@ except Exception:
     scipy = None
     scipy_stats = None
 
+try:
+    import yfinance as yf
+except Exception:
+    yf = None
+
 _BARS_DF_CACHE: Dict[str, Any] = {}
 _BARS_DF_CACHE_TTL_SECONDS = 300
 
@@ -2536,6 +2541,112 @@ async def get_crypto_latest_orderbook(
         return "\n".join(outputs)
     except Exception as e:
         return f"Error retrieving latest crypto orderbook for {symbol}: {str(e)}"
+
+# ============================================================================
+# Yahoo Finance Data Tools (fallback for data not on Alpaca)
+# ============================================================================
+
+@mcp.tool()
+async def get_yahoo_finance_data(
+    symbol: str,
+    period: str = "1y",
+    interval: str = "1d",
+    start: str = "",
+    end: str = "",
+) -> str:
+    """
+    Fetch historical market data from Yahoo Finance. Use this as a fallback for
+    data not available on Alpaca — e.g. VIX (^VIX), S&P 500 (^GSPC), Treasury
+    yields (^TNX), sector ETFs, international indices, or any ticker Yahoo supports.
+
+    Args:
+        symbol (str): Yahoo Finance ticker. Examples: '^VIX', '^GSPC', '^TNX',
+                       '^IXIC', 'GLD', 'TLT', 'SPY', 'AAPL'
+        period (str): How far back — '1d','5d','1mo','3mo','6mo','1y','2y','5y',
+                      '10y','ytd','max'. Ignored if start/end are provided.
+        interval (str): Bar size — '1m','2m','5m','15m','30m','60m','90m','1h',
+                        '1d','5d','1wk','1mo','3mo'. Intraday limited to last 60 days.
+        start (str): Start date 'YYYY-MM-DD' (optional, overrides period)
+        end (str): End date 'YYYY-MM-DD' (optional, defaults to today)
+
+    Returns:
+        str: JSON with OHLCV data, metadata, and basic stats
+    """
+    if yf is None:
+        return json.dumps({"error": "yfinance is not installed. Run: pip install yfinance"}, separators=(",", ":"))
+    if pd is None:
+        return json.dumps({"error": "pandas is required"}, separators=(",", ":"))
+
+    try:
+        ticker = yf.Ticker(symbol)
+
+        # Fetch history
+        kw: Dict[str, Any] = {"interval": interval}
+        if start:
+            kw["start"] = start
+            if end:
+                kw["end"] = end
+        else:
+            kw["period"] = period
+
+        df = ticker.history(**kw)
+
+        if df is None or df.empty:
+            return json.dumps({"error": f"No data returned for '{symbol}'. Check ticker symbol."}, separators=(",", ":"))
+
+        # Normalize index to date strings
+        df.index = pd.to_datetime(df.index)
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+
+        # Build OHLCV records (limit to 2000 for response size)
+        max_rows = 2000
+        if len(df) > max_rows:
+            df = df.tail(max_rows)
+
+        records = []
+        for idx, row in df.iterrows():
+            rec = {"date": idx.strftime("%Y-%m-%d")}
+            for col in ["Open", "High", "Low", "Close", "Volume"]:
+                if col in row.index:
+                    v = row[col]
+                    if pd.notna(v):
+                        rec[col.lower()] = round(float(v), 4) if col != "Volume" else int(v)
+            records.append(rec)
+
+        # Basic stats
+        close = df["Close"].dropna() if "Close" in df.columns else pd.Series(dtype=float)
+        stats: Dict[str, Any] = {}
+        if not close.empty:
+            stats["last"] = round(float(close.iloc[-1]), 4)
+            stats["high"] = round(float(close.max()), 4)
+            stats["low"] = round(float(close.min()), 4)
+            stats["mean"] = round(float(close.mean()), 4)
+            if len(close) > 1:
+                ret = close.pct_change().dropna()
+                stats["total_return_pct"] = round(float((close.iloc[-1] / close.iloc[0] - 1) * 100), 2)
+                stats["annualized_vol_pct"] = round(float(ret.std() * (252 ** 0.5) * 100), 2)
+
+        # Ticker info (name, type)
+        meta: Dict[str, Any] = {"symbol": symbol, "interval": interval, "rows": len(records)}
+        try:
+            info = ticker.info
+            if info:
+                for k in ["shortName", "longName", "quoteType", "currency", "exchange"]:
+                    if k in info and info[k]:
+                        meta[k] = info[k]
+        except Exception:
+            pass
+
+        return json.dumps({
+            "meta": meta,
+            "stats": stats,
+            "data": records,
+        }, separators=(",", ":"))
+
+    except Exception as e:
+        return json.dumps({"error": f"Yahoo Finance error for '{symbol}': {str(e)}"}, separators=(",", ":"))
+
 
 # ============================================================================
 # Options Market Data Tools

@@ -273,6 +273,47 @@ pf = vbt.Portfolio.from_signals(
 
 ---
 
+## Yahoo Finance Data Tool (fallback)
+
+Use `get_yahoo_finance_data` for data not available on Alpaca — indices, volatility, yields, international markets, etc.
+
+### Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `symbol` | `str` | required | Yahoo Finance ticker (e.g., `"^VIX"`, `"^GSPC"`, `"^TNX"`, `"GLD"`, `"TLT"`) |
+| `period` | `str` | `"1y"` | Lookback — `1d`, `5d`, `1mo`, `3mo`, `6mo`, `1y`, `2y`, `5y`, `10y`, `ytd`, `max`. Ignored if `start` is set. |
+| `interval` | `str` | `"1d"` | Bar size — `1m`, `5m`, `15m`, `1h`, `1d`, `1wk`, `1mo`. Intraday limited to last 60 days. |
+| `start` | `str` | `""` | Start date `YYYY-MM-DD` (overrides period) |
+| `end` | `str` | `""` | End date `YYYY-MM-DD` |
+
+### Common tickers
+
+| Ticker | Description |
+|--------|-------------|
+| `^VIX` | CBOE Volatility Index |
+| `^GSPC` | S&P 500 Index |
+| `^DJI` | Dow Jones Industrial Average |
+| `^IXIC` | Nasdaq Composite |
+| `^TNX` | 10-Year Treasury Yield |
+| `^TYX` | 30-Year Treasury Yield |
+| `^IRX` | 13-Week Treasury Bill |
+| `GLD` | Gold ETF |
+| `TLT` | 20+ Year Treasury Bond ETF |
+| `DX-Y.NYB` | US Dollar Index |
+
+### Example prompts
+
+- "Get VIX data for the last 2 years"
+- "Show S&P 500 weekly bars since 2020"
+- "Fetch 10-year Treasury yield daily data for 2024"
+
+### Response format
+
+Returns JSON with `meta` (symbol, name, rows), `stats` (last, high, low, mean, total_return_pct, annualized_vol_pct), and `data` (array of `{date, open, high, low, close, volume}`). Capped at 2000 rows.
+
+---
+
 ## ThetaData Options Tools (FREE historical EOD)
 
 These tools require the **Theta Terminal v3** running locally. It's a Java app that hosts a REST API on `http://127.0.0.1:25503`.
