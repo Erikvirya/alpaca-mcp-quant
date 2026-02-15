@@ -506,6 +506,26 @@ strategy_code: |
   pf = vbt.Portfolio.from_returns(total_ret.dropna(), init_cash=10000, freq='1D')
 ```
 
+### Local options data cache
+
+The tool checks for a local parquet cache before hitting the ThetaData API. This allows offline backtesting and avoids free-tier rate limits.
+
+| Detail | Value |
+|--------|-------|
+| Cache location | `data/options_cache/{SYMBOL}_eod.parquet` |
+| SPY cached range | 2024-02-01 → 2026-02-13 (2.6M rows, 36 MB) |
+| Columns | `date`, `expiration`, `strike`, `right`, `open`, `high`, `low`, `close`, `volume`, `bid`, `ask` |
+| Date format | YYYYMMDD int (e.g., `20250601`) |
+
+**How it works:** If the cache file exists and covers the requested date range, the tool loads from disk instantly. Otherwise it falls back to the ThetaData API (requires Theta Terminal running).
+
+**To download or update the cache:**
+```bash
+python download_options_data.py --symbol SPY --start 2024-02-01
+python download_options_data.py --symbol AAPL --start 2025-01-01 --max-dte 90
+```
+The script resumes automatically — it skips months already in the cache. Requires Theta Terminal running during download.
+
 ### Free tier vs paid tier
 
 - **Free tier** — EOD prices (OHLCV, bid/ask, volume). All helpers except delta-based selection work.
@@ -515,7 +535,7 @@ strategy_code: |
 ### Common mistakes (options backtest)
 
 1. **`start` is required** — unlike `execute_vectorbt_strategy`, you must specify a start date.
-2. **Theta Terminal must be running** — launch it before calling the tool.
+2. **Theta Terminal not needed if cache exists** — the tool reads from local parquet first. Only needed for uncached symbols/dates.
 3. **Helpers return `None` if no data** — always check for `None` before accessing fields.
 4. **`chain` dates are `pd.Timestamp`** — compare with `pd.Timestamp('2025-06-01')`, not strings.
 5. **`right` in chain is `'C'` or `'P'`** — uppercase single character.
