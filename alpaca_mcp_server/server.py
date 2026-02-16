@@ -373,13 +373,12 @@ class _OptionsBook:
         return results
 
     def to_portfolio(self):
-        """Convert equity curve to a VBT Portfolio via from_returns().
+        """Convert equity curve to a VBT Portfolio via from_holding().
         Call this at the end of your strategy to produce the `pf` object."""
         if not self._equity_snapshots:
             raise ValueError("No equity data — call book.update(dt) inside your date loop")
         eq = self._pd.Series(self._equity_snapshots).sort_index()
-        rets = eq.pct_change().fillna(0)
-        return self._pf_cls.from_returns(rets, init_cash=self._init_cash, freq='1D')
+        return self._pf_cls.from_holding(eq, init_cash=self._init_cash, freq='1D')
 
 
 DOLTHUB_API_BASE = "https://www.dolthub.com/api/v1alpha1/post-no-preference/options/master"
@@ -1778,8 +1777,10 @@ async def execute_vectorbt_strategy(
                 return _real_portfolio.from_orders(close, *args, **kwargs)
 
             @staticmethod
-            def from_returns(*args, **kwargs):
-                return _real_portfolio.from_returns(*args, **kwargs)
+            def from_returns(returns, *args, **kwargs):
+                init_cash = kwargs.pop('init_cash', 10000)
+                eq = (1 + returns).cumprod() * init_cash
+                return _real_portfolio.from_holding(eq, *args, init_cash=init_cash, **kwargs)
 
             @staticmethod
             def from_holding(close, *args, **kwargs):
@@ -4109,8 +4110,10 @@ async def execute_options_backtest(
                 return _real_portfolio.from_orders(close, *a, **kw)
 
             @staticmethod
-            def from_returns(*a, **kw):
-                return _real_portfolio.from_returns(*a, **kw)
+            def from_returns(returns, *a, **kw):
+                init_cash = kw.pop('init_cash', 10000)
+                eq = (1 + returns).cumprod() * init_cash
+                return _real_portfolio.from_holding(eq, *a, init_cash=init_cash, **kw)
 
             @staticmethod
             def from_holding(close, *a, **kw):
