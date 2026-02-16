@@ -131,6 +131,10 @@ class _OptionsBook:
         """Current cash balance."""
         return self._cash
 
+    @cash.setter
+    def cash(self, value):
+        self._cash = float(value)
+
     @property
     def equity(self):
         """Total portfolio equity (cash + position market values)."""
