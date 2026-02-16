@@ -393,7 +393,6 @@ To override the default URL, set the `THETADATA_URL` environment variable.
 | `get_theta_option_expirations(symbol)` | List all option expiration dates |
 | `get_theta_option_strikes(symbol, expiration)` | List strikes for a given expiration |
 | `get_theta_option_eod(symbol, expiration, strike, right, start_date, end_date)` | Historical EOD OHLCV + NBBO quote |
-| `get_theta_option_greeks_eod(symbol, expiration, strike, right, start_date, end_date)` | Historical EOD + all Greeks (delta, gamma, theta, vega, IV, etc.) |
 
 ### Parameters
 
@@ -408,7 +407,7 @@ To override the default URL, set the `THETADATA_URL` environment variable.
 ### Example prompts
 
 - "List all AAPL option expirations"
-- "Get SPY 550 call EOD with Greeks from 2026-01-01 to 2026-02-13"
+- "Get SPY 550 call EOD from 2026-01-01 to 2026-02-13"
 - "Show TSLA put option chain EOD, all strikes, expiring 2026-03-21, last 5 trading days"
 
 ### Notes
@@ -417,6 +416,7 @@ To override the default URL, set the `THETADATA_URL` environment variable.
 - Data is generated at **17:15 ET** each day
 - Results capped at **500 records** per call — use filters (`max_dte`, `num_strikes`, specific strike/expiration) to narrow
 - If Theta Terminal is not running, tools return a clear connection error
+- **Greeks are NOT available** on the free tier — use DoltHub or local cache (see below) for Greeks
 
 ---
 
@@ -715,38 +715,38 @@ strategy_code: |
   pf = book.to_portfolio()
 ```
 
-### Local options data cache
+### Local options data cache (with Greeks)
 
-The tool checks for a local parquet cache before hitting the ThetaData API. This allows offline backtesting and avoids free-tier rate limits.
+The download script fetches from **DoltHub** (free) and includes full Greeks. The backtester loads from cache first for instant offline backtesting.
 
 | Detail | Value |
 |--------|-------|
 | Cache location | `data/options_cache/{SYMBOL}_eod.parquet` |
-| SPY cached range | 2024-02-01 → 2026-02-13 (2.6M rows, 36 MB) |
-| Columns | `date`, `expiration`, `strike`, `right`, `open`, `high`, `low`, `close`, `volume`, `bid`, `ask` |
+| Data source | DoltHub (free, no terminal needed) |
+| Columns | `date`, `expiration`, `strike`, `right`, `open`, `high`, `low`, `close`, `bid`, `ask`, `volume`, `dte`, `iv`, `delta`, `gamma`, `theta`, `vega`, `rho` |
 | Date format | YYYYMMDD int (e.g., `20250601`) |
-
-**How it works:** If the cache file exists and covers the requested date range, the tool loads from disk instantly. Otherwise it falls back to the ThetaData API (requires Theta Terminal running).
+| Coverage | S&P 500 + SPY + SPDR ETFs, 2019–present, ~3 expirations per date |
 
 **To download or update the cache:**
 ```bash
-python download_options_data.py --symbol SPY --start 2024-02-01
+python download_options_data.py --symbol SPY --start 2024-01-01
 python download_options_data.py --symbol AAPL --start 2025-01-01 --max-dte 90
 ```
-The script resumes automatically — it skips months already in the cache. Requires Theta Terminal running during download.
+No external terminal needed — downloads directly from DoltHub API. The script resumes automatically — it skips months already cached. If an existing cache lacks Greeks, it re-downloads all months.
 
-### Free tier vs paid tier
+### Data source priority
 
-- **Free tier** — EOD prices (OHLCV, bid/ask, volume). All helpers except delta-based selection work.
-- **Standard tier ($30/mo)** — adds Greeks (delta, gamma, theta, vega, rho, IV). If you upgrade, the tool auto-detects and includes Greeks columns in `chain`.
-- **No delta column on free tier** — select contracts by strike price relative to ATM instead (e.g., `atm['strike'] * 0.95` for ~5% OTM put).
+1. **Local parquet cache** — instant, includes Greeks if downloaded from DoltHub
+2. **DoltHub API** — free fallback, Greeks included, S&P 500 only
+3. **ThetaData free-tier EOD** — all symbols, but no Greeks (needs Theta Terminal running)
 
 ### Common mistakes (options backtest)
 
 1. **`start` is required** — unlike `execute_vectorbt_strategy`, you must specify a start date.
-2. **Theta Terminal not needed if cache exists** — the tool reads from local parquet first. Only needed for uncached symbols/dates.
+2. **No terminal needed if cache exists** — the tool reads from local parquet first. Only needed for uncached symbols/dates not on DoltHub.
 3. **Helpers return `None` if no data** — always check for `None` before accessing fields.
 4. **`chain` dates are `pd.Timestamp`** — compare with `pd.Timestamp('2025-06-01')`, not strings.
 5. **`right` in chain is `'C'` or `'P'`** — uppercase single character.
 6. **No import statements needed** — everything is pre-loaded.
 7. **Strike may not match exactly** — use `get_chain_on_date` + find nearest strike when a computed strike doesn't exist.
+8. **DoltHub has ~3 expirations per date** — no LEAPs or far-dated monthlies. Use `nearest_expiry()` to find what's available.

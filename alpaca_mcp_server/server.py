@@ -3738,69 +3738,6 @@ async def get_theta_option_eod(
         return json.dumps({"error": str(e)}, separators=(",", ":"))
 
 
-@mcp.tool()
-async def get_theta_option_greeks_eod(
-    symbol: str,
-    expiration: str = "*",
-    strike: str = "*",
-    right: str = "call",
-    start_date: str = "",
-    end_date: str = "",
-    max_dte: Optional[int] = None,
-    num_strikes: Optional[int] = None,
-) -> str:
-    """
-    Retrieve historical End-of-Day (EOD) options data WITH Greeks from ThetaData (FREE tier).
-    Includes OHLCV, NBBO quote, and full greeks (delta, gamma, theta, vega, IV, etc.) per contract per day.
-    Requires the Theta Terminal to be running locally.
-
-    Args:
-        symbol (str): Underlying symbol (e.g., 'AAPL', 'SPY')
-        expiration (str): Expiration in YYYY-MM-DD or YYYYMMDD format, or '*' for all expirations (default: '*')
-        strike (str): Strike price in dollars (e.g., '170.000'), or '*' for all strikes (default: '*')
-        right (str): 'call' or 'put' (default: 'call')
-        start_date (str): Start date YYYY-MM-DD or YYYYMMDD (inclusive)
-        end_date (str): End date YYYY-MM-DD or YYYYMMDD (inclusive)
-        max_dte (Optional[int]): Only return contracts with DTE <= this value
-        num_strikes (Optional[int]): Number of strikes above/below ATM to return
-
-    Returns:
-        str: JSON with EOD option data including all Greeks (delta, gamma, theta, vega, rho, IV, vanna, charm, vomma, etc.)
-    """
-    try:
-        params = {
-            "symbol": symbol.upper(),
-            "expiration": expiration,
-            "strike": strike,
-            "right": right.lower(),
-            "start_date": start_date,
-            "end_date": end_date,
-            "max_dte": str(max_dte) if max_dte is not None else None,
-            "num_strikes": str(num_strikes) if num_strikes is not None else None,
-        }
-        rows = _theta_get("/v3/option/history/greeks/eod", params)
-        return json.dumps({
-            "symbol": symbol.upper(),
-            "right": right.lower(),
-            "expiration_filter": expiration,
-            "strike_filter": strike,
-            "start_date": start_date,
-            "end_date": end_date,
-            "record_count": len(rows),
-            "data": rows[:500],
-            "truncated": len(rows) > 500,
-        }, separators=(",", ":"))
-    except _requests.exceptions.ConnectionError:
-        return json.dumps({
-            "error": "Cannot connect to Theta Terminal at " + THETADATA_URL +
-                     ". Make sure the Theta Terminal v3 is running."
-        }, separators=(",", ":"))
-    except _requests.exceptions.HTTPError as e:
-        return json.dumps({"error": f"ThetaData API error: {str(e)}"}, separators=(",", ":"))
-    except Exception as e:
-        return json.dumps({"error": str(e)}, separators=(",", ":"))
-
-
 # ============================================================================
 # Options Backtesting Tool (ThetaData + VectorBT)
 # ============================================================================
@@ -3954,10 +3891,10 @@ async def execute_options_backtest(
 
         all_chain_rows: list = []
         fetch_errors: list = []
-        greeks_available = True
+        greeks_available = False
         cache_used = False
 
-        # Check for local parquet cache first
+        # Check for local parquet cache first (may include Greeks from DoltHub)
         _cache_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                   "data", "options_cache")
         _cache_path = os.path.join(_cache_dir, f"{symbol}_eod.parquet")
@@ -3996,7 +3933,7 @@ async def execute_options_backtest(
             except Exception as e:
                 fetch_errors.append(f"dolthub: {str(e)}")
 
-        # Fall back to ThetaData API if no cache or DoltHub hit
+        # Fall back to ThetaData free-tier EOD (no Greeks) if no cache or DoltHub hit
         if not all_chain_rows:
             for r in rights_list:
                 _params = {
@@ -4005,10 +3942,7 @@ async def execute_options_backtest(
                     "max_dte": str(max_dte), "num_strikes": str(strike_count),
                 }
                 try:
-                    if greeks_available:
-                        rows = _theta_get("/v3/option/history/greeks/eod", _params)
-                    else:
-                        rows = _theta_get("/v3/option/history/eod", _params)
+                    rows = _theta_get("/v3/option/history/eod", _params)
                     all_chain_rows.extend(rows)
                 except _requests.exceptions.ConnectionError:
                     return json.dumps({
@@ -4016,16 +3950,6 @@ async def execute_options_backtest(
                                  ". Make sure the Theta Terminal v3 is running, "
                                  "or download data locally first with download_options_data.py"
                     }, separators=(",", ":"))
-                except _requests.exceptions.HTTPError as e:
-                    if e.response is not None and e.response.status_code in (403, 401):
-                        greeks_available = False
-                        try:
-                            rows = _theta_get("/v3/option/history/eod", _params)
-                            all_chain_rows.extend(rows)
-                        except Exception as e2:
-                            fetch_errors.append(f"{r}: {str(e2)}")
-                    else:
-                        fetch_errors.append(f"{r}: {str(e)}")
                 except Exception as e:
                     fetch_errors.append(f"{r}: {str(e)}")
 
