@@ -3995,6 +3995,16 @@ async def execute_options_backtest(
         if "date" in chain.columns and "expiration" in chain.columns:
             chain["dte"] = (chain["expiration"] - chain["date"]).dt.days
 
+        # Merge underlying close into chain if missing
+        if "underlying_close" not in chain.columns and "date" in chain.columns and underlying_df is not None and len(underlying_df) > 0:
+            ul_close = underlying_df[["Close"]].copy()
+            ul_close.index = pd.to_datetime(ul_close.index)
+            ul_close = ul_close.rename(columns={"Close": "underlying_close"})
+            ul_close["_merge_date"] = ul_close.index
+            chain["_merge_date"] = chain["date"].dt.normalize()
+            chain = chain.merge(ul_close[["_merge_date", "underlying_close"]], on="_merge_date", how="left")
+            chain.drop(columns=["_merge_date"], inplace=True)
+
         timings_ms["chain_fetch"] = int((time.perf_counter() - t_chain_start) * 1000)
         timings_ms["chain_records"] = len(chain)
         timings_ms["greeks_available"] = greeks_available
