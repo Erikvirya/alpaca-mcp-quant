@@ -717,22 +717,30 @@ strategy_code: |
 
 ### Local options data cache (with Greeks)
 
-The download script fetches from **DoltHub** (free) and includes full Greeks. The backtester loads from cache first for instant offline backtesting.
+The download script fetches from **DoltHub** (free) and includes full Greeks. The backtester loads from cache first for instant offline backtesting — no terminal or API key needed.
 
 | Detail | Value |
 |--------|-------|
 | Cache location | `data/options_cache/{SYMBOL}_eod.parquet` |
 | Data source | DoltHub (free, no terminal needed) |
-| Columns | `date`, `expiration`, `strike`, `right`, `open`, `high`, `low`, `close`, `bid`, `ask`, `volume`, `dte`, `iv`, `delta`, `gamma`, `theta`, `vega`, `rho` |
+| Columns (18) | `date`, `expiration`, `strike`, `right`, `open`, `high`, `low`, `close`, `bid`, `ask`, `volume`, `dte`, `iv`, `delta`, `gamma`, `theta`, `vega`, `rho` |
 | Date format | YYYYMMDD int (e.g., `20250601`) |
-| Coverage | S&P 500 + SPY + SPDR ETFs, 2019–present, ~3 expirations per date |
+| Greeks null % | **0%** — all rows have delta, gamma, theta, vega, rho, iv populated |
 
-**To download or update the cache:**
+### Pre-built cache
+
+| Symbol | Date range | Rows | File size | Expirations |
+|--------|-----------|------|-----------|-------------|
+| **SPY** | 2024-01-01 → 2026-02-15 | 61,934 | 1.9 MB | ~3 short-term per date |
+
+To add more symbols, run:
 ```bash
-python download_options_data.py --symbol SPY --start 2024-01-01
-python download_options_data.py --symbol AAPL --start 2025-01-01 --max-dte 90
+python download_options_data.py --symbol AAPL --start 2024-01-01
+python download_options_data.py --symbol QQQ --start 2024-01-01 --max-dte 60
 ```
-No external terminal needed — downloads directly from DoltHub API. The script resumes automatically — it skips months already cached. If an existing cache lacks Greeks, it re-downloads all months.
+No external terminal needed — downloads directly from DoltHub API. The script uses daily queries with call/put split to stay within API limits. Resumes automatically — skips dates already cached. If an existing cache lacks Greeks, it re-downloads everything.
+
+**DoltHub symbol coverage:** S&P 500 components + SPY + SPDR sector ETFs (XLF, XLE, XLK, etc.), 2019–present, ~3 short-term expirations per date (~2wk, ~4wk, ~8wk).
 
 ### Data source priority
 
