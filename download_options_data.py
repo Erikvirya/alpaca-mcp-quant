@@ -45,33 +45,31 @@ def _to_yyyymmdd_int(series):
     return pd.to_numeric(s, errors="coerce").fillna(0).astype(int)
 
 
-def month_ranges(start: datetime, end: datetime):
-    """Yield (start_date, end_date) tuples for each month in the range."""
-    current = start.replace(day=1)
+def day_ranges(start: datetime, end: datetime):
+    """Yield individual dates in the range (skipping weekends)."""
+    current = start
     while current <= end:
-        month_start = max(current, start)
-        if current.month == 12:
-            next_month = current.replace(year=current.year + 1, month=1)
-        else:
-            next_month = current.replace(month=current.month + 1)
-        month_end = min(next_month - timedelta(days=1), end)
-        yield month_start, month_end
-        current = next_month
+        if current.weekday() < 5:  # Mon-Fri only
+            yield current
+        current += timedelta(days=1)
 
 
-def fetch_month(symbol: str, start_date: str, end_date: str, max_dte: int) -> list:
-    """Fetch one month of option chain data with Greeks from DoltHub.
-    Returns list of normalized row dicts ready for parquet."""
-    sql = (
-        f"SELECT date, act_symbol, expiration, strike, call_put, "
-        f"bid, ask, vol, delta, gamma, theta, vega, rho "
-        f"FROM option_chain "
-        f"WHERE act_symbol = '{symbol}' "
-        f"AND date >= '{start_date}' AND date <= '{end_date}' "
-        f"ORDER BY date, expiration, strike"
-    )
-
-    rows = dolthub_query(sql)
+def fetch_chunk(symbol: str, start_date: str, end_date: str, max_dte: int) -> list:
+    """Fetch one chunk of option chain data with Greeks from DoltHub.
+    Splits by call/put to keep queries small. Returns normalized row dicts."""
+    rows = []
+    for cp in ["Call", "Put"]:
+        sql = (
+            f"SELECT date, act_symbol, expiration, strike, call_put, "
+            f"bid, ask, vol, delta, gamma, theta, vega, rho "
+            f"FROM option_chain "
+            f"WHERE act_symbol = '{symbol}' "
+            f"AND date >= '{start_date}' AND date <= '{end_date}' "
+            f"AND call_put = '{cp}' "
+            f"ORDER BY date, expiration, strike"
+        )
+        rows.extend(dolthub_query(sql))
+        time.sleep(0.3)
     normalized = []
     for row in rows:
         d_str = row.get("date", "")
@@ -127,20 +125,17 @@ def download_symbol(symbol: str, start: str, end: str, max_dte: int = 90):
     out_path = os.path.join(CACHE_DIR, f"{symbol.upper()}_eod.parquet")
 
     # Load existing data to enable resume
-    existing_months = set()
+    existing_dates = set()
     existing_df = None
     if os.path.exists(out_path):
         existing_df = pd.read_parquet(out_path)
         if "date" in existing_df.columns:
-            def _date_to_month_key(d):
-                s = str(int(d))
-                return f"{s[:4]}-{s[4:6]}"
-            existing_months = set(existing_df["date"].apply(_date_to_month_key).unique())
-        print(f"  Existing cache: {len(existing_df)} rows, {len(existing_months)} months")
+            existing_dates = set(existing_df["date"].astype(int).unique())
+        print(f"  Existing cache: {len(existing_df)} rows, {len(existing_dates)} unique dates")
         has_greeks = "delta" in existing_df.columns
         if not has_greeks:
-            print("  ⚠ Existing cache lacks Greeks — will re-download all months from DoltHub")
-            existing_months = set()
+            print("  ⚠ Existing cache lacks Greeks — will re-download from DoltHub")
+            existing_dates = set()
             existing_df = None
 
     start_dt = datetime.strptime(start, "%Y-%m-%d")
@@ -151,41 +146,38 @@ def download_symbol(symbol: str, start: str, end: str, max_dte: int = 90):
         all_chunks.append(existing_df)
 
     total_new = 0
-    months = list(month_ranges(start_dt, end_dt))
+    days = list(day_ranges(start_dt, end_dt))
 
-    for i, (ms, me) in enumerate(months, 1):
-        month_key = ms.strftime("%Y-%m")
-        if month_key in existing_months:
-            print(f"  [{i}/{len(months)}] {month_key} — already cached, skipping")
+    for i, dt in enumerate(days, 1):
+        date_int = int(dt.strftime("%Y%m%d"))
+        if date_int in existing_dates:
             continue
 
-        s = ms.strftime("%Y-%m-%d")
-        e = me.strftime("%Y-%m-%d")
-        label = f"[{i}/{len(months)}] {month_key}"
+        s = dt.strftime("%Y-%m-%d")
+        label = f"[{i}/{len(days)}] {s}"
 
         try:
-            month_rows = fetch_month(symbol.upper(), s, e, max_dte)
-            print(f"  {label}: {len(month_rows)} rows")
+            chunk_rows = fetch_chunk(symbol.upper(), s, s, max_dte)
+            if chunk_rows:
+                print(f"  {label}: {len(chunk_rows)} rows")
+            # else: no data (holiday) — silently skip
         except requests.exceptions.HTTPError as ex:
             print(f"  {label}: HTTP error {ex}")
-            month_rows = []
+            chunk_rows = []
         except requests.exceptions.ConnectionError as ex:
             print(f"  {label}: Connection error — {ex}")
-            month_rows = []
+            chunk_rows = []
         except Exception as ex:
             print(f"  {label}: Error — {ex}")
-            month_rows = []
+            chunk_rows = []
 
-        if month_rows:
-            chunk = pd.DataFrame(month_rows)
+        if chunk_rows:
+            chunk = pd.DataFrame(chunk_rows)
             all_chunks.append(chunk)
-            total_new += len(month_rows)
+            total_new += len(chunk_rows)
 
-        # Rate-limit to be polite to DoltHub API
-        time.sleep(0.5)
-
-        # Save incrementally every 3 months
-        if i % 3 == 0 and all_chunks:
+        # Save incrementally every 50 trading days (~2.5 months)
+        if total_new > 0 and i % 50 == 0 and all_chunks:
             combined = pd.concat(all_chunks, ignore_index=True)
             combined.to_parquet(out_path, index=False)
             print(f"  — Saved checkpoint: {len(combined)} total rows")
