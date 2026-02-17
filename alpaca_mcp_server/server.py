@@ -1703,6 +1703,16 @@ async def execute_vectorbt_strategy(
 
             _bars_cache_set(cache_key_sym, timeframe, limit, df, start, end)
 
+        # ── Normalize all timestamps to tz-naive (date-only) ──
+        # Alpaca returns UTC-aware timestamps; Yahoo returns tz-naive.
+        # Stripping tz here means strategy code never has to worry about it.
+        if hasattr(df.index, 'tz') and df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+        # Normalize to date-level index for daily bars to ensure clean joins
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.to_datetime(df.index)
+        df.index = df.index.normalize()
+
         # Build dfs convenience dict and filter symbols to only those with data
         if is_multi:
             dfs: Dict[str, Any] = {}
@@ -1870,6 +1880,36 @@ async def execute_vectorbt_strategy(
             "slice": slice,
         }
 
+        # ── Alignment helpers for multi-source data ──
+        _base_index = df.index  # tz-naive, normalized
+
+        def _sandbox_yf_download(ticker, start=None, end=None, period="1y", align=True):
+            """Download Yahoo Finance data, optionally aligned to df's index.
+            When align=True (default), the result is reindexed to match df's
+            trading calendar with forward-fill, so you can freely combine
+            Alpaca and Yahoo data without index mismatch errors."""
+            raw = _yf_download(ticker, start=start, end=end, period=period)
+            if align and raw is not None and not raw.empty:
+                raw.index = raw.index.normalize()
+                raw = raw.reindex(_base_index, method='ffill')
+            return raw
+
+        def _align(data, fill_method='ffill'):
+            """Align any Series or DataFrame to df's trading calendar.
+            Strips timezone, normalizes dates, and reindexes with forward-fill.
+            Use this to merge external data into your strategy.
+            Example: vix = align(yf_download('^VIX', align=False))"""
+            if data is None:
+                return data
+            if isinstance(data, (pd.Series, pd.DataFrame)):
+                d = data.copy()
+                if hasattr(d.index, 'tz') and d.index.tz is not None:
+                    d.index = d.index.tz_localize(None)
+                d.index = pd.to_datetime(d.index).normalize()
+                d = d.reindex(_base_index, method=fill_method)
+                return d
+            return data
+
         sandbox: Dict[str, Any] = {
             "__builtins__": allowed_builtins,
             "df": df,
@@ -1887,7 +1927,8 @@ async def execute_vectorbt_strategy(
             "scipy_stats": scipy_stats,
             "itertools": itertools,
             "math": math,
-            "yf_download": _yf_download,
+            "yf_download": _sandbox_yf_download,
+            "align": _align,
         }
 
         t_exec_start = time.perf_counter()
