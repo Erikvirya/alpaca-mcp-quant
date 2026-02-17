@@ -25,6 +25,7 @@ import itertools
 import math
 import csv
 import io
+import concurrent.futures
 import requests as _requests
 from datetime import datetime, timedelta, date, timezone
 from typing import Dict, Any, List, Optional, Union
@@ -1440,7 +1441,8 @@ async def execute_vectorbt_strategy(
     timeframe: str = "1Day", 
     start: Optional[str] = None, 
     end: Optional[str] = None,
-    limit: int = 1000
+    limit: int = 1000,
+    max_seconds: int = 300
 ) -> str:
     """
     Executes a VectorBT strategy code against historical data for one or more symbols.
@@ -1456,6 +1458,7 @@ async def execute_vectorbt_strategy(
         start (Optional[str]): Start date ISO string (e.g. "2023-01-01").
         end (Optional[str]): End date ISO string (e.g. "2023-12-31").
         limit (int): Max number of bars if start/end not fully specified. Default 1000.
+        max_seconds (int): Maximum strategy execution time in seconds. Default 300 (5 min).
 
     Returns:
         JSON string containing stats, equity curve, and timings.
@@ -1591,7 +1594,20 @@ async def execute_vectorbt_strategy(
                     {"error": {"message": f"Invalid end date: {end}"}},
                     separators=(",", ":"),
                 )
-        
+
+        # Auto-increase limit when start is specified to cover full date range
+        if start_dt is not None and limit <= 1000:
+            ref_end = end_dt if end_dt else datetime.now(timezone.utc)
+            days_span = (ref_end - start_dt).days
+            # ~252 trading days/year, add 20% buffer
+            estimated_bars = int(days_span * 252 / 365 * 1.2)
+            if estimated_bars > limit:
+                limit = max(limit, min(estimated_bars, 10000))
+                timings_ms["auto_limit"] = limit
+
+        # Clamp max_seconds
+        max_seconds = min(max(max_seconds, 30), 600)
+
         # Cache key uses sorted symbols string for consistency
         cache_key_sym = ",".join(sorted(symbols))
         t_cache_start = time.perf_counter()
@@ -1931,8 +1947,31 @@ async def execute_vectorbt_strategy(
             "align": _align,
         }
 
+        # Run strategy in a thread with timeout to prevent MCP client disconnects
         t_exec_start = time.perf_counter()
-        exec(strategy_code, sandbox, sandbox)
+        exec_error = [None]
+
+        def _run_strategy():
+            try:
+                exec(strategy_code, sandbox, sandbox)
+            except Exception as e:
+                exec_error[0] = e
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            fut = pool.submit(_run_strategy)
+            try:
+                fut.result(timeout=max_seconds)
+            except concurrent.futures.TimeoutError:
+                elapsed = int(time.perf_counter() - t_exec_start)
+                return json.dumps(
+                    {"error": {"message": f"Strategy execution timed out after {elapsed}s (max_seconds={max_seconds}). "
+                               "Simplify the strategy or increase max_seconds (max 600)."}},
+                    separators=(",", ":"),
+                )
+
+        if exec_error[0] is not None:
+            raise exec_error[0]
+
         timings_ms["strategy_exec"] = int((time.perf_counter() - t_exec_start) * 1000)
 
         pf = sandbox.get("pf")
