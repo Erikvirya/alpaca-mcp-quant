@@ -1798,6 +1798,16 @@ async def execute_vectorbt_strategy(
                         ep = open_prices.iloc[:, 0]
                 else:
                     ep = open_prices
+                # Align exec_price index to close so vbt broadcast doesn't fail
+                if close_idx is not None and isinstance(ep, (pd.Series, pd.DataFrame)):
+                    if not ep.index.equals(close_idx):
+                        ep_idx = ep.index
+                        if hasattr(ep_idx, 'tz') and ep_idx.tz is not None:
+                            ep = ep.copy()
+                            ep.index = ep_idx.tz_localize(None)
+                        naive_close = close_idx.tz_localize(None) if hasattr(close_idx, 'tz') and close_idx.tz is not None else close_idx
+                        ep = ep.reindex(naive_close, method='nearest')
+                        ep.index = close_idx
                 return orig_from_signals(ep, entries_lag, exits_lag, *args, **kwargs)
 
             @staticmethod
