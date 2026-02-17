@@ -1749,9 +1749,34 @@ async def execute_vectorbt_strategy(
                 d = kwargs["direction"].lower().strip()
                 kwargs["direction"] = _direction_map.get(d, d)
 
+        def _align_to_close(sig, close_idx):
+            """Reindex a signal Series/DataFrame to match close's index, filling False."""
+            if sig is None:
+                return None
+            if pd is not None and isinstance(sig, (pd.Series, pd.DataFrame)):
+                if not sig.index.equals(close_idx):
+                    # Strip timezone info from both to allow alignment
+                    if hasattr(sig.index, 'tz') and sig.index.tz is not None:
+                        sig = sig.copy()
+                        sig.index = sig.index.tz_localize(None)
+                    idx = close_idx
+                    if hasattr(idx, 'tz') and idx.tz is not None:
+                        idx = idx.tz_localize(None)
+                    sig = sig.reindex(idx, fill_value=False)
+                    sig.index = close_idx
+            return sig
+
         class _PortfolioProxy:
             @staticmethod
             def from_signals(close, entries, exits=None, *args, **kwargs):
+                close_idx = close.index if pd is not None and isinstance(close, (pd.Series, pd.DataFrame)) else None
+                if close_idx is not None:
+                    entries = _align_to_close(entries, close_idx)
+                    exits = _align_to_close(exits, close_idx)
+                    if "short_entries" in kwargs:
+                        kwargs["short_entries"] = _align_to_close(kwargs["short_entries"], close_idx)
+                    if "short_exits" in kwargs:
+                        kwargs["short_exits"] = _align_to_close(kwargs["short_exits"], close_idx)
                 entries_lag = _lag_one(entries)
                 exits_lag = _lag_one(exits)
                 if "short_entries" in kwargs:
