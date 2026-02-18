@@ -2033,7 +2033,8 @@ async def execute_vectorbt_strategy(
                     elif not minimize and score > best_score:
                         best_score = score
                         best_params = params
-                except Exception:
+                except Exception as _gs_err:
+                    results.append({**params, 'score': None, 'error': str(_gs_err)})
                     continue
             return {'best_params': best_params or {}, 'best_score': best_score, 'results': results}
 
@@ -2074,17 +2075,23 @@ async def execute_vectorbt_strategy(
             oos_equities = []
             window_params = []
             current_cash = float(init_cash)
+            _skip_reasons = []
 
             for train_mask, test_mask in _wfo_splits(close.index, train_months, test_months, start_year):
                 train_close = close[train_mask]
                 test_close = close[test_mask]
                 if len(train_close) < 20 or len(test_close) < 5:
+                    _skip_reasons.append(f"too few bars: train={len(train_close)}, test={len(test_close)}")
                     continue
 
                 # Optimize on training data
                 gs = _wfo_grid_search(train_close, param_grid, strategy_fn, metric=metric)
                 best = gs['best_params']
                 if not best:
+                    errors = [r.get('error') for r in gs['results'] if r.get('error')]
+                    _skip_reasons.append(f"grid search found no valid params. "
+                                         f"Combos tested: {len(gs['results'])}. "
+                                         f"Errors: {errors[:2] if errors else 'none (scores were None)'}")
                     continue
 
                 # Apply best params to OOS test data
@@ -2114,7 +2121,15 @@ async def execute_vectorbt_strategy(
                 })
 
             if not oos_equities:
-                raise ValueError("WFO produced no valid windows. Check date range and param_grid.")
+                diag = (f"WFO produced no valid windows. "
+                        f"Data range: {close.index.min().date()} → {close.index.max().date()} "
+                        f"({len(close)} bars). "
+                        f"train_months={train_months}, test_months={test_months}, "
+                        f"start_year={start_year or 'auto'}. "
+                        f"Skipped windows: {len(_skip_reasons)}. ")
+                if _skip_reasons:
+                    diag += f"Reasons: {_skip_reasons[:3]}"
+                raise ValueError(diag)
 
             # Stitch OOS equity into one continuous series
             oos_equity = pd.concat(oos_equities)
