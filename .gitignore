@@ -24,6 +24,13 @@ thetadata/config.toml
 # Cached options data (large parquet files)
 data/options_cache/
 
+# Strategy code & reports (private — not for git)
+DARWIN_REGIME/
+strategy_*.md
+diagnostic_*.md
+generate_chart.py
+check_balance.py
+
 # OS
 .DS_Store
 Thumbs.db

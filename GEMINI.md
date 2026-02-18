@@ -279,13 +279,60 @@ pf = vbt.Portfolio.from_signals(
 
 ---
 
+## Futures Backtesting (ES/MES)
+
+The sandbox supports backtesting on S&P 500 futures via Yahoo Finance continuous contracts. Use `yf_download('ES=F')` to fetch E-mini S&P 500 data (2016–present) or `yf_download('MES=F')` for Micro E-mini (2019–present).
+
+### Quick start — Futures backtest
+
+```
+symbol: "SPY"
+start: "2016-01-01"
+strategy_code: |
+  # Use ES=F continuous contract instead of Alpaca SPY data
+  es = yf_download('ES=F', start='2016-01-01', align=False)
+  close = es['Close']
+  vix = yf_download('^VIX', start='2016-01-01')['Close'].reindex(close.index).ffill()
+
+  # Strategy logic (same as SPY — instrument-agnostic)
+  ema_50 = close.ewm(span=50, adjust=False).mean()
+  entries = close > ema_50
+  exits = close < ema_50
+  pf = vbt.Portfolio.from_signals(close, entries, exits, freq='1D')
+```
+
+### Available futures tickers (yfinance)
+
+| Ticker | Instrument | Point Value | History |
+|--------|-----------|-------------|---------|
+| `ES=F` | E-mini S&P 500 | $50/pt | 2016+ |
+| `MES=F` | Micro E-mini S&P 500 | $5/pt | 2019+ |
+| `NQ=F` | E-mini Nasdaq-100 | $20/pt | 2016+ |
+| `MNQ=F` | Micro E-mini Nasdaq-100 | $2/pt | 2019+ |
+
+### Position sizing for futures
+
+The strategy outputs an allocation signal (0.1–2.0). For live futures trading, use `futures_config.py` to convert to discrete contract counts:
+
+```python
+from futures_config import MES, allocation_to_contracts
+n = allocation_to_contracts(alloc=1.2, account_equity=25000, price=6860, contract=MES)
+# -> 16 MES contracts
+```
+
+### Notes
+- `ES=F` and `MES=F` are **continuous front-month contracts** — yfinance auto-rolls quarterly. No manual rollover stitching needed for backtesting.
+- Futures prices track SPY closely but are not identical (futures include cost-of-carry). Strategy signals (EMA, RSI, etc.) work the same way.
+- For live trading, roll to the next quarterly contract 1-2 days before the 3rd Friday of Mar/Jun/Sep/Dec.
+- No overnight financing fees (unlike CFDs) — this is the primary advantage of futures over CFD/stock-based execution.
+
+---
+
 ## Walk-Forward Optimization (WFO) — Built-in Helpers
 
-The sandbox includes three WFO utility functions that handle the rolling train/test split, parameter grid search, and OOS equity stitching. This eliminates manual loop code and prevents common WFO bugs (index misalignment, look-ahead in training, equity chain breaks).
+The sandbox includes three WFO utility functions that handle the rolling train/test split, parameter grid search, and OOS equity stitching.
 
 ### Quick start — `wfo_run` (one-liner WFO)
-
-The easiest way to run a full WFO backtest:
 
 ```
 symbol: "SPY"
@@ -294,7 +341,6 @@ max_seconds: 600
 strategy_code: |
   close = df['Close']
 
-  # Define your strategy as a function: (close, **params) -> (entries, exits)
   def my_strategy(close, sma_slow=200, ema_fast=50):
       sma = close.rolling(sma_slow).mean()
       ema = close.ewm(span=ema_fast).mean()
@@ -302,15 +348,13 @@ strategy_code: |
       exits = (close < sma) & (close < ema)
       return entries.fillna(False), exits.fillna(False)
 
-  # Define parameter grid
   grid = {
       'sma_slow': [180, 200, 220],
       'ema_fast': [40, 50, 60],
   }
 
-  # Run WFO: 12-month train, 12-month test, maximize total_return
   result = wfo_run(close, grid, my_strategy, train_months=12, test_months=12)
-  pf = result['pf']  # VBT Portfolio from stitched OOS equity
+  pf = result['pf']
 ```
 
 ### `wfo_run` parameters
