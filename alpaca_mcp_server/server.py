@@ -1926,6 +1926,208 @@ async def execute_vectorbt_strategy(
                 return d
             return data
 
+        # ── Walk-Forward Optimization (WFO) helpers ──
+
+        def _wfo_splits(index, train_months=12, test_months=12, start_year=None):
+            """Generate (train_slice, test_slice) pairs for rolling WFO.
+
+            Args:
+                index: DatetimeIndex of the data (e.g. df.index).
+                train_months: Length of training window in months (default 12).
+                test_months: Length of out-of-sample test window in months (default 12).
+                start_year: First year to begin training. If None, inferred from data.
+
+            Yields:
+                Tuples of (train_mask, test_mask) boolean Series aligned to index.
+
+            Example::
+
+                for train_mask, test_mask in wfo_splits(df.index, 12, 12):
+                    train_close = df['Close'][train_mask]
+                    test_close  = df['Close'][test_mask]
+            """
+            from dateutil.relativedelta import relativedelta
+            idx = pd.DatetimeIndex(index)
+            if start_year is None:
+                # Need at least train_months of data before first test
+                first_test = idx.min() + relativedelta(months=train_months)
+                start_year = first_test.year
+            current = pd.Timestamp(f"{start_year}-01-01")
+            while True:
+                train_start = current - relativedelta(months=train_months)
+                train_end = current - timedelta(days=1)
+                test_start = current
+                test_end = current + relativedelta(months=test_months) - timedelta(days=1)
+                train_mask = (idx >= train_start) & (idx <= train_end)
+                test_mask = (idx >= test_start) & (idx <= test_end)
+                if not train_mask.any():
+                    break
+                if not test_mask.any():
+                    break
+                yield (pd.Series(train_mask, index=index), pd.Series(test_mask, index=index))
+                current = current + relativedelta(months=test_months)
+                if current > idx.max():
+                    break
+
+        def _wfo_grid_search(close, param_grid, strategy_fn, metric='total_return'):
+            """Evaluate a parameter grid on training data and return best params.
+
+            Args:
+                close: Series of close prices (training period only).
+                param_grid: Dict of param_name -> list of values.
+                    Example: {'sma_fast': [10,20,30], 'sma_slow': [100,150,200]}
+                strategy_fn: Callable(close, **params) -> (entries, exits).
+                    Must return boolean Series of same length as close.
+                metric: Metric to maximize. One of: 'total_return', 'sharpe_ratio',
+                    'sortino_ratio', 'calmar_ratio', 'max_drawdown' (minimized).
+
+            Returns:
+                Dict with keys: 'best_params', 'best_score', 'results' (list of all combos).
+
+            Example::
+
+                def my_strat(close, sma_fast=20, sma_slow=200):
+                    fast = close.rolling(sma_fast).mean()
+                    slow = close.rolling(sma_slow).mean()
+                    entries = (fast > slow) & (fast.shift(1) <= slow.shift(1))
+                    exits   = (fast < slow) & (fast.shift(1) >= slow.shift(1))
+                    return entries.fillna(False), exits.fillna(False)
+
+                result = wfo_grid_search(train_close, grid, my_strat)
+                best = result['best_params']
+            """
+            import itertools as _it
+            keys = list(param_grid.keys())
+            values = list(param_grid.values())
+            best_score = None
+            best_params = None
+            results = []
+            minimize = metric in ('max_drawdown',)
+            for combo in _it.product(*values):
+                params = dict(zip(keys, combo))
+                try:
+                    entries, exits = strategy_fn(close, **params)
+                    pf_test = _real_portfolio.from_signals(close, entries.shift(1).fillna(False),
+                                                          exits.shift(1).fillna(False), freq='1D')
+                    stats = pf_test.stats()
+                    if hasattr(stats, 'to_dict'):
+                        stats = stats.to_dict()
+                    score = None
+                    for k, v in stats.items():
+                        k_lower = str(k).lower().replace(' ', '_').replace('[%]', '').strip('_')
+                        if metric.lower().replace(' ', '_') in k_lower:
+                            try:
+                                score = float(v)
+                            except (ValueError, TypeError):
+                                pass
+                            break
+                    if score is None:
+                        continue
+                    results.append({**params, 'score': score})
+                    if best_score is None:
+                        best_score = score
+                        best_params = params
+                    elif minimize and score < best_score:
+                        best_score = score
+                        best_params = params
+                    elif not minimize and score > best_score:
+                        best_score = score
+                        best_params = params
+                except Exception:
+                    continue
+            return {'best_params': best_params or {}, 'best_score': best_score, 'results': results}
+
+        def _wfo_run(close, param_grid, strategy_fn, train_months=12, test_months=12,
+                     start_year=None, metric='total_return', init_cash=100000):
+            """Full Walk-Forward Optimization: split → optimize → stitch OOS equity.
+
+            Args:
+                close: Full Series of close prices (df['Close']).
+                param_grid: Dict of param_name -> list of values.
+                strategy_fn: Callable(close, **params) -> (entries, exits).
+                train_months: Training window in months (default 12).
+                test_months: Test window in months (default 12).
+                start_year: First year to begin training. If None, auto.
+                metric: Metric to maximize during optimization (default 'total_return').
+                init_cash: Starting capital (default 100000).
+
+            Returns:
+                Dict with keys:
+                    'pf': VBT Portfolio from stitched OOS equity curve.
+                    'oos_equity': Series of out-of-sample equity.
+                    'window_params': List of dicts with train/test dates and best params.
+                    'window_count': Number of WFO windows.
+
+            Example::
+
+                def regime_strat(close, sma=200, ema=50, rsi_thresh=50):
+                    sma_line = close.rolling(sma).mean()
+                    ema_line = close.ewm(span=ema).mean()
+                    entries = (close > sma_line) | ((close > ema_line) & (rsi > rsi_thresh))
+                    exits = (close < sma_line) & (close < ema_line)
+                    return entries.fillna(False), exits.fillna(False)
+
+                grid = {'sma': [180,200,220], 'ema': [40,50,60], 'rsi_thresh': [45,50,55]}
+                result = wfo_run(df['Close'], grid, regime_strat, train_months=12, test_months=12)
+                pf = result['pf']  # assign to pf for the backtester to pick up
+            """
+            oos_equities = []
+            window_params = []
+            current_cash = float(init_cash)
+
+            for train_mask, test_mask in _wfo_splits(close.index, train_months, test_months, start_year):
+                train_close = close[train_mask]
+                test_close = close[test_mask]
+                if len(train_close) < 20 or len(test_close) < 5:
+                    continue
+
+                # Optimize on training data
+                gs = _wfo_grid_search(train_close, param_grid, strategy_fn, metric=metric)
+                best = gs['best_params']
+                if not best:
+                    continue
+
+                # Apply best params to OOS test data
+                entries, exits = strategy_fn(test_close, **best)
+                pf_oos = _real_portfolio.from_signals(
+                    test_close,
+                    entries.shift(1).fillna(False),
+                    exits.shift(1).fillna(False),
+                    init_cash=current_cash, freq='1D'
+                )
+
+                # Extract equity and chain it
+                eq = pf_oos.value()
+                if isinstance(eq, pd.DataFrame):
+                    eq = eq.iloc[:, 0]
+                oos_equities.append(eq)
+                current_cash = float(eq.iloc[-1])
+
+                window_params.append({
+                    'train_start': str(train_close.index.min().date()),
+                    'train_end': str(train_close.index.max().date()),
+                    'test_start': str(test_close.index.min().date()),
+                    'test_end': str(test_close.index.max().date()),
+                    'best_params': best,
+                    'best_score': gs['best_score'],
+                    'oos_return_pct': round(float((eq.iloc[-1] / eq.iloc[0] - 1) * 100), 2),
+                })
+
+            if not oos_equities:
+                raise ValueError("WFO produced no valid windows. Check date range and param_grid.")
+
+            # Stitch OOS equity into one continuous series
+            oos_equity = pd.concat(oos_equities)
+            # Build portfolio from the stitched equity curve
+            pf_final = _real_portfolio.from_holding(oos_equity, init_cash=init_cash, freq='1D')
+
+            return {
+                'pf': pf_final,
+                'oos_equity': oos_equity,
+                'window_params': window_params,
+                'window_count': len(window_params),
+            }
+
         sandbox: Dict[str, Any] = {
             "__builtins__": allowed_builtins,
             "df": df,
@@ -1945,6 +2147,9 @@ async def execute_vectorbt_strategy(
             "math": math,
             "yf_download": _sandbox_yf_download,
             "align": _align,
+            "wfo_splits": _wfo_splits,
+            "wfo_grid_search": _wfo_grid_search,
+            "wfo_run": _wfo_run,
         }
 
         # Run strategy in a thread with timeout to prevent MCP client disconnects

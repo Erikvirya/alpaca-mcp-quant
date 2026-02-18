@@ -37,7 +37,8 @@ You are a client of the Alpaca MCP server. Your role:
 | `timeframe` | `str` | `"1Day"` | Bar timeframe: `"1Day"`, `"1Hour"`, `"5Min"`, `"15Min"`, `"1Week"`, etc. |
 | `start` | `str` or `null` | `null` | Start date ISO string, e.g. `"2023-01-01"`. If omitted, auto-calculated from limit. |
 | `end` | `str` or `null` | `null` | End date ISO string, e.g. `"2025-12-31"`. If omitted, defaults to now. |
-| `limit` | `int` | `1000` | Max bars to fetch (used when start/end not fully specified). |
+| `limit` | `int` | `1000` | Max bars to fetch. **Auto-increased** when `start` is specified to cover the full date range (up to 10,000). |
+| `max_seconds` | `int` | `300` | Max strategy execution time in seconds (30–600). Increase for heavy WFO strategies. |
 
 ### Sandbox Environment
 
@@ -62,7 +63,11 @@ Your `strategy_code` runs in a restricted sandbox. **Do NOT use import statement
 | `scipy_stats` | scipy.stats | Statistical distributions, t-tests, z-scores, etc. |
 | `itertools` | itertools | Combinations, permutations, etc. Use `itertools.combinations(symbols, 2)` for pairs. |
 | `math` | math | Standard math functions (sqrt, log, ceil, floor, etc.). |
-| `yf_download` | function | Fetch Yahoo Finance data: `yf_download('^VIX')`, `yf_download('^TNX', start='2024-01-01')`. Returns DataFrame with tz-naive DatetimeIndex. |
+| `yf_download` | function | Fetch Yahoo Finance data: `yf_download('^VIX', start='2024-01-01')`. **Auto-aligned** to `df`'s index by default (pass `align=False` to get raw). |
+| `align` | function | Align any external Series/DataFrame to `df`'s trading calendar: `aligned = align(my_data)`. Strips tz, normalizes dates, forward-fills. |
+| `wfo_splits` | function | Generate rolling train/test window masks for Walk-Forward Optimization. See WFO section below. |
+| `wfo_grid_search` | function | Evaluate a parameter grid on training data and return best params. See WFO section below. |
+| `wfo_run` | function | Full WFO pipeline: split → optimize → stitch OOS equity → return portfolio. See WFO section below. |
 
 #### Available builtins
 
@@ -271,6 +276,147 @@ pf = vbt.Portfolio.from_signals(
 6. **Use IEX-compatible symbols** — major US equities and ETFs work. OTC/illiquid may not.
 7. **Direction strings** — use `"shortonly"` not `"short"`, `"longonly"` not `"long"`.
 8. **All Portfolio constructors are available** — `from_signals`, `from_orders`, `from_returns`, `from_holding`, `from_random_signals`.
+
+---
+
+## Walk-Forward Optimization (WFO) — Built-in Helpers
+
+The sandbox includes three WFO utility functions that handle the rolling train/test split, parameter grid search, and OOS equity stitching. This eliminates manual loop code and prevents common WFO bugs (index misalignment, look-ahead in training, equity chain breaks).
+
+### Quick start — `wfo_run` (one-liner WFO)
+
+The easiest way to run a full WFO backtest:
+
+```
+symbol: "SPY"
+start: "2015-01-01"
+max_seconds: 600
+strategy_code: |
+  close = df['Close']
+
+  # Define your strategy as a function: (close, **params) -> (entries, exits)
+  def my_strategy(close, sma_slow=200, ema_fast=50):
+      sma = close.rolling(sma_slow).mean()
+      ema = close.ewm(span=ema_fast).mean()
+      entries = (close > sma) | (close > ema)
+      exits = (close < sma) & (close < ema)
+      return entries.fillna(False), exits.fillna(False)
+
+  # Define parameter grid
+  grid = {
+      'sma_slow': [180, 200, 220],
+      'ema_fast': [40, 50, 60],
+  }
+
+  # Run WFO: 12-month train, 12-month test, maximize total_return
+  result = wfo_run(close, grid, my_strategy, train_months=12, test_months=12)
+  pf = result['pf']  # VBT Portfolio from stitched OOS equity
+```
+
+### `wfo_run` parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `close` | `pd.Series` | required | Full close price series (e.g. `df['Close']`) |
+| `param_grid` | `dict` | required | `{param_name: [values]}` — all combinations are tested |
+| `strategy_fn` | `callable` | required | `fn(close, **params) -> (entries, exits)` — must return boolean Series |
+| `train_months` | `int` | `12` | Training window length in months |
+| `test_months` | `int` | `12` | Out-of-sample test window length in months |
+| `start_year` | `int` | auto | First year to begin testing. If None, inferred from data + train_months |
+| `metric` | `str` | `'total_return'` | Metric to maximize: `'total_return'`, `'sharpe_ratio'`, `'sortino_ratio'`, `'calmar_ratio'`, `'max_drawdown'` (minimized) |
+| `init_cash` | `float` | `100000` | Starting capital |
+
+### `wfo_run` return value
+
+Returns a dict with:
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `pf` | VBT Portfolio | Portfolio from stitched OOS equity — assign to `pf` for the backtester |
+| `oos_equity` | `pd.Series` | Full out-of-sample equity curve |
+| `window_params` | `list[dict]` | Per-window details: train/test dates, best params, OOS return |
+| `window_count` | `int` | Number of WFO windows executed |
+
+### `wfo_splits` — manual train/test windows
+
+For custom WFO loops where you need more control:
+
+```python
+for train_mask, test_mask in wfo_splits(df.index, train_months=12, test_months=12):
+    train_close = df['Close'][train_mask]
+    test_close = df['Close'][test_mask]
+    # ... your optimization logic here
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `index` | DatetimeIndex | required | `df.index` |
+| `train_months` | `int` | `12` | Training window |
+| `test_months` | `int` | `12` | Test window |
+| `start_year` | `int` | auto | First year to begin |
+
+Yields `(train_mask, test_mask)` — boolean Series aligned to the index.
+
+### `wfo_grid_search` — parameter optimization
+
+Evaluate all parameter combinations on training data:
+
+```python
+result = wfo_grid_search(train_close, grid, my_strategy, metric='sharpe_ratio')
+best_params = result['best_params']  # e.g. {'sma_slow': 200, 'ema_fast': 50}
+best_score = result['best_score']    # e.g. 1.23
+all_results = result['results']      # list of all combos with scores
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `close` | `pd.Series` | required | Training close prices only |
+| `param_grid` | `dict` | required | `{param_name: [values]}` |
+| `strategy_fn` | `callable` | required | `fn(close, **params) -> (entries, exits)` |
+| `metric` | `str` | `'total_return'` | Metric to maximize (or minimize for `'max_drawdown'`) |
+
+### WFO with external data (VIX, yields, etc.)
+
+Use `yf_download` (auto-aligned) and `align` to mix data sources safely:
+
+```
+symbol: "SPY"
+start: "2015-01-01"
+max_seconds: 600
+strategy_code: |
+  close = df['Close']
+  vix = yf_download('^VIX', start='2015-01-01')['Close']  # auto-aligned to df
+
+  def regime_strategy(close, sma=200, vix_thresh=25):
+      sma_line = close.rolling(sma).mean()
+      # vix is already aligned — safe to combine with close
+      bull = (close > sma_line) & (vix < vix_thresh)
+      bear = (close < sma_line) | (vix > 35)
+      return bull.fillna(False), bear.fillna(False)
+
+  grid = {'sma': [180, 200, 220], 'vix_thresh': [20, 25, 30]}
+  result = wfo_run(close, grid, regime_strategy, train_months=12, test_months=12)
+  pf = result['pf']
+```
+
+### Multi-source data alignment
+
+All data in the sandbox is **tz-naive and date-normalized**:
+
+- **`df` (Alpaca data)** — automatically stripped of UTC timezone and normalized to midnight
+- **`yf_download(ticker, align=True)`** — Yahoo data auto-reindexed to `df`'s trading calendar with forward-fill (default)
+- **`align(data)`** — manually align any external Series/DataFrame to `df`'s calendar
+
+This means you can freely combine Alpaca prices with Yahoo VIX/yields without timezone or index mismatch errors.
+
+### WFO tips
+
+1. **Use `max_seconds=600`** for WFO strategies — they are computationally heavy.
+2. **Keep grids small** — 3×3×3 = 27 combos per window is fine. 5×5×5 = 125 may timeout.
+3. **Yearly cadence is safest** — `train_months=12, test_months=12`. Monthly re-optimization is too slow.
+4. **`strategy_fn` must return boolean Series** — use `.fillna(False)` on all signals.
+5. **Signals are auto-lagged** inside `wfo_grid_search` and `wfo_run` — do NOT manually shift.
+6. **Equity chains automatically** — `wfo_run` passes ending equity as starting cash for the next window.
 
 ---
 
