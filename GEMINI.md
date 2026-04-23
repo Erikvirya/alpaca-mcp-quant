@@ -550,7 +550,24 @@ The `timings` output includes `dolthub_used: true/false` to show which source wa
 
 ---
 
-## ThetaData Options Tools (FREE historical EOD)
+## Databento Intraday & Futures Data (Primary Source)
+
+Databento is the preferred source for high-resolution intraday (1m) data and institutional-grade futures backtesting. It provides cleaner data and longer history than Alpaca/Yahoo for research tasks.
+
+### Key Datasets
+- **XNAS.ITCH**: 1-minute OHLCV for US Equities (QQQ, SPY, etc.)
+- **GLBX.MDP3**: CME/CBOT Futures (NQ, ES, CL, etc.)
+- **OPRA.PILLAR**: Full options feeds (used for 0DTE research)
+
+### Configuration
+Credentials are loaded from `databento.env`. Data is typically cached in `market_data/` as `.parquet` files to save credits.
+
+### Usage in Research
+Scripts like `fetch_qqq_databento.py` and `research_v3_5yr_backtest.py` demonstrate the integration. Always check `market_data/` for existing parity before fetching.
+
+---
+
+## ThetaData Options Tools (LEGACY - Phasing Out)
 
 These tools require the **Theta Terminal v3** running locally. It's a Java app that hosts a REST API on `http://127.0.0.1:25503`.
 
@@ -935,8 +952,9 @@ No external terminal needed — downloads directly from DoltHub API. The script 
 ### Data source priority
 
 1. **Local parquet cache** — instant, includes Greeks if downloaded from DoltHub
-2. **DoltHub API** — free fallback, Greeks included, S&P 500 only
-3. **ThetaData free-tier EOD** — all symbols, but no Greeks (needs Theta Terminal running)
+2. **Databento (XNAS/OPRA)** — primary source for high-res intraday and institutional futures
+3. **DoltHub API** — free fallback, Greeks included, S&P 500 only
+4. **ThetaData (LEGACY)** — phasing out, use only if Databento/DoltHub are unavailable
 
 ### Common mistakes (options backtest)
 
